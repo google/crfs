@@ -55,10 +55,9 @@ look it up by its path name.
 
 Fortunately, we can fix the fact that *tar.gz* files are unindexed and
 unseekable, while still making the file a valid *tar.gz* file by
-taking advantage of the properties of both tar files and gzip
-compression in that you can concatenate tar files together to make
-valid tar files, and you can concatenate multiple gzip streams
-together and have a valid gzip stream.
+taking advantage of the fact that two gzip streams can be concatenated
+and still be a valid gzip stream. So you can just make a tar file
+where each tar entry is its own gzip stream.
 
 We introduce a format, **Stargz**, a **S**eekable
 **tar.gz** format that's still a valid tar.gz file for everything else
@@ -66,8 +65,8 @@ that's unaware of these details.
 
 In summary:
 
-* That traditional `*.tar.gz` format is: `GZIP(TAR(file1 + file2 + file3))`
-* Stargz's format is: `GZIP(TAR(file1)) + GZIP(TAR(file2)) + GZIP(TAR(file3_chunk1)) + GZIP(TAR(file3_chunk2)) + GZIP(TAR(index of earlier files in magic file))`, where the trailing ZIP-like index contains offsets for each file/chunk's GZIP header in the overall **stargz** file.
+* That traditional `*.tar.gz` format is: `Gzip(TarF(file1) + TarF(file2) + TarF(file3) + TarFooter))`
+* Stargz's format is: `Gzip(TarF(file1)) + Gzip(TarF(file2)) + Gzip(TarF(file3_chunk1)) + Gzip(F(file3_chunk2)) + Gzip(F(index of earlier files in magic file), TarFooter)`, where the trailing ZIP-like index contains offsets for each file/chunk's GZIP header in the overall **stargz** file.
 
 This makes images a few percent larger (due to more gzip headers and
 loss of compression context between files), but it's plenty
@@ -83,7 +82,7 @@ not yet. So for now we need to convert the storage image layers from
 
 ## Operation
 
-When mounting an image, the FUSE filesystem makes does a couple Docker
+When mounting an image, the FUSE filesystem makes a couple Docker
 Registry HTTP API requests to the container registry to get the
 metadata for the container and all its layers.
 
