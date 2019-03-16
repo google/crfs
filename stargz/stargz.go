@@ -18,7 +18,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
+	"os"
+	"path"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -44,7 +49,15 @@ const FooterSize = 47
 // A Reader permits random access reads from a stargz file.
 type Reader struct {
 	sr  *io.SectionReader
-	TOC *TOC
+	toc *jtoc
+
+	// m stores all non-chunk entries, keyed by name.
+	m map[string]*TOCEntry
+
+	// chunks stores all TOCEntry values for regular files that
+	// are split up. For a file with a single chunk, it's only
+	// stored in m.
+	chunks map[string][]*TOCEntry
 }
 
 // Open opens a stargz file for reading.
@@ -79,26 +92,64 @@ func Open(sr *io.SectionReader) (*Reader, error) {
 	if h.Name != TOCTarName {
 		return nil, fmt.Errorf("TOC tar entry had name %q; expected %q", h.Name, TOCTarName)
 	}
-	toc := new(TOC)
+	toc := new(jtoc)
 	if err := json.NewDecoder(tr).Decode(&toc); err != nil {
 		return nil, fmt.Errorf("error decoding TOC JSON: %v", err)
 	}
-	return &Reader{sr: sr, TOC: toc}, nil
+	r := &Reader{sr: sr, toc: toc}
+	r.initFields()
+	return r, nil
 }
 
 // TOCEntry is an entry in the stargz file's TOC (Table of Contents).
 type TOCEntry struct {
-	Offset   int64  `json:"offset,omitempty"` // offset to gzip stream of tar entry (for regular files only)
-	Name     string `json:"name"`
-	Type     string `json:"type"` // "dir", "reg", TODO
-	Size     int64  `json:"size,omitempty"`
-	LinkName string `json:"linkName,omitempty"`  // for symlinks
-	Mode     int64  `json:"mode,omitempty"`      // Permission and mode bits
-	Uid      int    `json:"uid,omitempty"`       // User ID of owner
-	Gid      int    `json:"gid,omitempty"`       // Group ID of owner
-	Uname    string `json:"userName,omitempty"`  // User name of owner
-	Gname    string `json:"groupName,omitempty"` // Group name of owner
-	ModTime  string `json:"modtime,omitempty"`
+	// Name is the tar entry's name. It is the complete path
+	// stored in the tar file, not just the base name.
+	Name string `json:"name"`
+
+	// Type is one of "dir", "reg", "symlink", or "chunk".
+	// The "chunk" type is used for regular file data chunks past the first
+	// TOCEntry; the 2nd chunk and on have only Type ("chunk"), Offset,
+	// ChunkOffset, and ChunkSize populated.
+	Type string `json:"type"`
+
+	// Size, for regular files, is the logical size of the file.
+	Size int64 `json:"size,omitempty"`
+
+	// ModTime3339 is the modification time of the tar entry. Empty
+	// means zero or unknown. Otherwise it's in UTC RFC3339
+	// format. Use the ModTime method to access the time.Time value.
+	ModTime3339 string `json:"modtime,omitempty"`
+	modTime     time.Time
+
+	// LinkName, for symlinks, is the link target.
+	LinkName string `json:"linkName,omitempty"`
+
+	// Mode is the permission and mode bits.
+	Mode int64 `json:"mode,omitempty"`
+
+	// Uid is the user ID of the owner.
+	Uid int `json:"uid,omitempty"`
+
+	// Gid is the group ID of the owner.
+	Gid int `json:"gid,omitempty"`
+
+	// Uname is the username of the owner.
+	//
+	// In the serialized JSON, this field may only be present for
+	// the first entry with the same Uid.
+	Uname string `json:"userName,omitempty"`
+
+	// Gname is the group name of the owner.
+	//
+	// In the serialized JSON, this field may only be present for
+	// the first entry with the same Gid.
+	Gname string `json:"groupName,omitempty"`
+
+	// Offset, for regular files, provides the offset in the
+	// stargz file to the file's data bytes. See ChunkOffset and
+	// ChunkSize.
+	Offset int64 `json:"offset,omitempty"`
 
 	// ChunkOffset is non-zero if this is a chunk of a large,
 	// regular file. If so, the Offset is where the gzip header of
@@ -108,12 +159,162 @@ type TOCEntry struct {
 	// Offset.
 	ChunkOffset int64 `json:"chunkOffset,omitempty"`
 	ChunkSize   int64 `json:"chunkSize,omitempty"`
+
+	children []*TOCEntry // TODO: populate; add TOCEntry.Readdir
 }
 
-// TOC is the table of contents index of the files in the stargz file.
-type TOC struct {
-	Version int        `json:"version"`
-	Entries []TOCEntry `json:"entries"`
+// ModTime returns the entry's modification time.
+func (e *TOCEntry) ModTime() time.Time { return e.modTime }
+
+// jtoc is the JSON-serialized table of contents index of the files in the stargz file.
+type jtoc struct {
+	Version int         `json:"version"`
+	Entries []*TOCEntry `json:"entries"`
+}
+
+// fileInfo implements os.FileInfo using the wrapped *TOCEntry.
+type fileInfo struct{ e *TOCEntry }
+
+var _ os.FileInfo = fileInfo{}
+
+func (fi fileInfo) Name() string       { return path.Base(fi.e.Name) }
+func (fi fileInfo) IsDir() bool        { return fi.e.Type == "dir" }
+func (fi fileInfo) Size() int64        { return fi.e.Size }
+func (fi fileInfo) ModTime() time.Time { return fi.e.ModTime() }
+func (fi fileInfo) Sys() interface{}   { return fi.e }
+func (fi fileInfo) Mode() (m os.FileMode) {
+	m = os.FileMode(fi.e.Mode) & os.ModePerm
+	switch fi.e.Type {
+	case "dir":
+		m |= os.ModeDir
+	case "symlink":
+		m |= os.ModeSymlink
+	}
+	return m
+}
+
+// initFields populates the Reader from r.toc after decoding it from
+// JSON.
+//
+// Unexported fields are populated and TOCEntry fields that were
+// implicit in the JSON are populated.
+func (r *Reader) initFields() {
+	r.m = make(map[string]*TOCEntry, len(r.toc.Entries))
+	r.chunks = make(map[string][]*TOCEntry)
+	var lastPath string
+	uname := map[int]string{}
+	gname := map[int]string{}
+	for _, ent := range r.toc.Entries {
+		ent.Name = strings.TrimPrefix(ent.Name, "./")
+		if ent.Type == "chunk" {
+			ent.Name = lastPath
+			r.chunks[ent.Name] = append(r.chunks[ent.Name], ent)
+		} else {
+			lastPath = ent.Name
+
+			if ent.Uname != "" {
+				uname[ent.Uid] = ent.Uname
+			} else {
+				ent.Uname = uname[ent.Uid]
+			}
+			if ent.Gname != "" {
+				gname[ent.Gid] = ent.Gname
+			} else {
+				ent.Gname = uname[ent.Gid]
+			}
+
+			ent.modTime, _ = time.Parse(time.RFC3339, ent.ModTime3339)
+
+			r.m[ent.Name] = ent
+		}
+		if ent.Type == "reg" && ent.ChunkSize > 0 && ent.ChunkSize < ent.Size {
+			r.chunks[ent.Name] = make([]*TOCEntry, 0, ent.Size/ent.ChunkSize+1)
+			r.chunks[ent.Name] = append(r.chunks[ent.Name], ent)
+		}
+	}
+}
+
+// Lookup returns the Table of Contents entry for the given path.
+func (r *Reader) Lookup(path string) (e *TOCEntry, ok bool) {
+	if r == nil {
+		return
+	}
+	e, ok = r.m[path]
+	return
+}
+
+func (r *Reader) OpenFile(name string) (*io.SectionReader, error) {
+	ent, ok := r.Lookup(name)
+	if !ok {
+		// TODO: come up with some error plan. This is lazy:
+		return nil, &os.PathError{
+			Path: name,
+			Op:   "OpenFile",
+			Err:  os.ErrNotExist,
+		}
+	}
+	if ent.Type != "reg" {
+		return nil, &os.PathError{
+			Path: name,
+			Op:   "OpenFile",
+			Err:  errors.New("not a regular file"),
+		}
+	}
+	fr := &fileReader{
+		r:    r,
+		size: ent.Size,
+		ents: []*TOCEntry{ent},
+	}
+	if ents, ok := r.chunks[name]; ok {
+		fr.ents = ents
+	}
+	return io.NewSectionReader(fr, 0, fr.size), nil
+}
+
+type fileReader struct {
+	r    *Reader
+	size int64
+	ents []*TOCEntry // 1 or more reg/chunk entries
+}
+
+func (fr *fileReader) ReadAt(p []byte, off int64) (n int, err error) {
+	if off >= fr.size {
+		return 0, io.EOF
+	}
+	if off < 0 {
+		return 0, errors.New("invalid offset")
+	}
+	var i int
+	if len(fr.ents) > 1 {
+		i = sort.Search(len(fr.ents), func(i int) bool {
+			return fr.ents[i].ChunkOffset >= off
+		})
+		if i == -1 {
+			return 0, errors.New("internal error; error finding chunk given offset")
+		}
+	}
+	ent := fr.ents[i]
+	if ent.ChunkOffset > off {
+		if i == 0 {
+			return 0, errors.New("internal error; first chunk offset is non-zero")
+		}
+		ent = fr.ents[i-1]
+	}
+
+	//  If ent is a chunk of a large file, adjust the ReadAt
+	//  offset by the chunk's offset.
+	off -= ent.ChunkOffset
+
+	gzOff := ent.Offset
+	sr := io.NewSectionReader(fr.r.sr, gzOff, fr.r.sr.Size()-gzOff)
+	gz, err := gzip.NewReader(sr)
+	if err != nil {
+		return 0, fmt.Errorf("fileReader.ReadAt.gzipNewReader: %v", err)
+	}
+	if n, err := io.CopyN(ioutil.Discard, gz, off); n != off || err != nil {
+		return 0, fmt.Errorf("discard of %d bytes = %v, %v", off, n, err)
+	}
+	return io.ReadFull(gz, p)
 }
 
 // A Writer writes stargz files.
@@ -122,10 +323,31 @@ type TOC struct {
 type Writer struct {
 	bw  *bufio.Writer
 	cw  *countWriter
-	toc *TOC
+	toc *jtoc
 
-	closed bool
-	gz     *gzip.Writer
+	closed        bool
+	gz            *gzip.Writer
+	lastUsername  map[int]string
+	lastGroupname map[int]string
+
+	// ChunkSize optionally controls the maximum number of bytes
+	// of data of a regular file that can be written in one gzip
+	// stream before a new gzip stream is started.
+	// Zero means to use a default, currently 4 MiB.
+	ChunkSize int
+}
+
+// currentGzipWriter writes to the current w.gz field, can change
+// throughout writing a tar entry.
+type currentGzipWriter struct{ w *Writer }
+
+func (cgw currentGzipWriter) Write(p []byte) (int, error) { return cgw.w.gz.Write(p) }
+
+func (w *Writer) chunkSize() int {
+	if w.ChunkSize <= 0 {
+		return 4 << 20
+	}
+	return w.ChunkSize
 }
 
 // NewWriter returns a new stargz writer writing to w.
@@ -137,7 +359,7 @@ func NewWriter(w io.Writer) *Writer {
 	return &Writer{
 		bw:  bw,
 		cw:  cw,
-		toc: &TOC{Version: 1},
+		toc: &jtoc{Version: 1},
 	}
 }
 
@@ -156,6 +378,7 @@ func (w *Writer) Close() error {
 	// Write the TOC index.
 	tocOff := w.cw.n
 	w.gz, _ = gzip.NewWriterLevel(w.cw, gzip.BestCompression)
+	w.gz.Extra = []byte("stargz.toc")
 	tw := tar.NewWriter(w.gz)
 	tocJSON, err := json.MarshalIndent(w.toc, "", "\t")
 	if err != nil {
@@ -204,6 +427,28 @@ func (w *Writer) closeGz() error {
 	return nil
 }
 
+// nameIfChanged returns name, unless it was the already the value of (*mp)[id],
+// in which case it returns the empty string.
+func (w *Writer) nameIfChanged(mp *map[int]string, id int, name string) string {
+	if name == "" {
+		return ""
+	}
+	if *mp == nil {
+		*mp = make(map[int]string)
+	}
+	if (*mp)[id] == name {
+		return ""
+	}
+	(*mp)[id] = name
+	return name
+}
+
+func (w *Writer) condOpenGz() {
+	if w.gz == nil {
+		w.gz, _ = gzip.NewWriterLevel(w.cw, gzip.BestCompression)
+	}
+}
+
 // AppendTar reads the tar or tar.gz file from r and appends
 // each of its contents to w.
 //
@@ -227,14 +472,19 @@ func (w *Writer) AppendTar(r io.Reader) error {
 		if err != nil {
 			return fmt.Errorf("error reading from source tar: tar.Reader.Next: %v", err)
 		}
-		ent := TOCEntry{
-			Name:    h.Name,
-			Mode:    h.Mode,
-			Uid:     h.Uid,
-			Gid:     h.Gid,
-			Uname:   h.Uname,
-			Gname:   h.Gname,
-			ModTime: formatModtime(h.ModTime),
+		ent := &TOCEntry{
+			Name:        h.Name,
+			Mode:        h.Mode,
+			Uid:         h.Uid,
+			Gid:         h.Gid,
+			Uname:       w.nameIfChanged(&w.lastUsername, h.Uid, h.Uname),
+			Gname:       w.nameIfChanged(&w.lastGroupname, h.Gid, h.Gname),
+			ModTime3339: formatModtime(h.ModTime),
+		}
+		w.condOpenGz()
+		tw := tar.NewWriter(currentGzipWriter{w})
+		if err := tw.WriteHeader(h); err != nil {
+			return err
 		}
 		switch h.Typeflag {
 		case tar.TypeLink:
@@ -245,30 +495,44 @@ func (w *Writer) AppendTar(r io.Reader) error {
 		case tar.TypeDir:
 			ent.Type = "dir"
 		case tar.TypeReg:
-			ent.Offset = w.cw.n
 			ent.Type = "reg"
 			ent.Size = h.Size
-
-			// Start a new gzip stream for regular files.
-			if err := w.closeGz(); err != nil {
-				return err
-			}
 		default:
 			return fmt.Errorf("unsupported input tar entry %q", h.Typeflag)
 		}
-		w.toc.Entries = append(w.toc.Entries, ent)
-		if w.gz == nil {
-			w.gz, err = gzip.NewWriterLevel(w.cw, gzip.BestCompression)
-			if err != nil {
-				return err
+
+		if h.Typeflag == tar.TypeReg {
+			var written int64
+			totalSize := ent.Size // save it before we destroy ent
+			for written < totalSize {
+				if err := w.closeGz(); err != nil {
+					return err
+				}
+
+				chunkSize := int64(w.chunkSize())
+				remain := totalSize - written
+				if remain < chunkSize {
+					chunkSize = remain
+				} else {
+					ent.ChunkSize = chunkSize
+				}
+				ent.Offset = w.cw.n
+				ent.ChunkOffset = written
+
+				w.condOpenGz()
+
+				if _, err := io.CopyN(tw, tr, chunkSize); err != nil {
+					return fmt.Errorf("error copying %q: %v", h.Name, err)
+				}
+				w.toc.Entries = append(w.toc.Entries, ent)
+				written += chunkSize
+				ent = &TOCEntry{
+					Name: h.Name,
+					Type: "chunk",
+				}
 			}
-		}
-		tw := tar.NewWriter(w.gz)
-		if err := tw.WriteHeader(h); err != nil {
-			return err
-		}
-		if _, err := io.Copy(tw, tr); err != nil {
-			return err
+		} else {
+			w.toc.Entries = append(w.toc.Entries, ent)
 		}
 		if err := tw.Flush(); err != nil {
 			return err
@@ -312,11 +576,7 @@ func formatModtime(t time.Time) string {
 	if t.IsZero() || t.Unix() == 0 {
 		return ""
 	}
-	t = t.UTC()
-	if t.Equal(t.Round(time.Second)) {
-		return t.UTC().Format(time.RFC3339)
-	}
-	return t.UTC().Format(time.RFC3339Nano)
+	return t.UTC().Round(time.Second).Format(time.RFC3339)
 }
 
 // countWriter counts how many bytes have been written to its wrapped
