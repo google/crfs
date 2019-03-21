@@ -107,7 +107,7 @@ type TOCEntry struct {
 	// stored in the tar file, not just the base name.
 	Name string `json:"name"`
 
-	// Type is one of "dir", "reg", "symlink", or "chunk".
+	// Type is one of "dir", "reg", "symlink", "hardlink", or "chunk".
 	// The "chunk" type is used for regular file data chunks past the first
 	// TOCEntry; the 2nd chunk and on have only Type ("chunk"), Offset,
 	// ChunkOffset, and ChunkSize populated.
@@ -122,7 +122,7 @@ type TOCEntry struct {
 	ModTime3339 string `json:"modtime,omitempty"`
 	modTime     time.Time
 
-	// LinkName, for symlinks, is the link target.
+	// LinkName, for symlinks and hardlinks, is the link target.
 	LinkName string `json:"linkName,omitempty"`
 
 	// Mode is the permission and mode bits.
@@ -239,6 +239,9 @@ func (r *Reader) Lookup(path string) (e *TOCEntry, ok bool) {
 	if r == nil {
 		return
 	}
+	// TODO: decide at which stage to handle hard links. Probably
+	// here? And it probably needs a link count field stored in
+	// the TOCEntry.
 	e, ok = r.m[path]
 	return
 }
@@ -488,7 +491,8 @@ func (w *Writer) AppendTar(r io.Reader) error {
 		}
 		switch h.Typeflag {
 		case tar.TypeLink:
-			return fmt.Errorf("TODO: unsupported hardlink %q => %q", h.Name, h.Linkname)
+			ent.Type = "hardlink"
+			ent.LinkName = h.Linkname
 		case tar.TypeSymlink:
 			ent.Type = "symlink"
 			ent.LinkName = h.Linkname
