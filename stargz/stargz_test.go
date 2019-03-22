@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -65,6 +67,8 @@ func TestWriteAndOpen(t *testing.T) {
 				hasFileLen("foo/bar.txt", len(content)),
 				hasFileContentsRange("foo/bar.txt", 0, content),
 				hasFileContentsRange("foo/bar.txt", 1, content[1:]),
+				entryHasChildren("", "foo"),
+				entryHasChildren("foo", "bar.txt"),
 			),
 		},
 		{
@@ -80,6 +84,8 @@ func TestWriteAndOpen(t *testing.T) {
 				hasDir("bar/"),
 				hasDir("foo/"),
 				hasFileLen("foo/bar.txt", len(content)),
+				entryHasChildren("", "bar", "foo"),
+				entryHasChildren("foo", "bar.txt"),
 			),
 		},
 		{
@@ -92,6 +98,8 @@ func TestWriteAndOpen(t *testing.T) {
 			want: checks(
 				numTOCEntries(2),
 				hasSymlink("foo/bar", "../../x"),
+				entryHasChildren("", "foo"),
+				entryHasChildren("foo", "bar"),
 			),
 		},
 		{
@@ -241,6 +249,25 @@ func hasFileContentsRange(file string, offset int, want string) stargzCheck {
 		}
 		if string(got) != want {
 			t.Fatalf("ReadAt(len %d, offset %d) = %q, want %q", len(got), offset, got, want)
+		}
+	})
+}
+
+func entryHasChildren(dir string, want ...string) stargzCheck {
+	return stargzCheckFn(func(t *testing.T, r *Reader) {
+		want := append([]string(nil), want...)
+		var got []string
+		ent, ok := r.Lookup(dir)
+		if !ok {
+			t.Fatalf("didn't find TOCEntry for dir node %q", dir)
+		}
+		for baseName := range ent.children {
+			got = append(got, baseName)
+		}
+		sort.Strings(got)
+		sort.Strings(want)
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("children of %q = %q; want %q", dir, got, want)
 		}
 	})
 }

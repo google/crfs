@@ -160,16 +160,42 @@ type TOCEntry struct {
 	ChunkOffset int64 `json:"chunkOffset,omitempty"`
 	ChunkSize   int64 `json:"chunkSize,omitempty"`
 
-	children []*TOCEntry // TODO: populate; add TOCEntry.Readdir
+	children map[string]*TOCEntry
 }
 
 // ModTime returns the entry's modification time.
 func (e *TOCEntry) ModTime() time.Time { return e.modTime }
 
+func (e *TOCEntry) addChild(baseName string, child *TOCEntry) {
+	if e.children == nil {
+		e.children = make(map[string]*TOCEntry)
+	}
+	e.children[baseName] = child
+}
+
 // jtoc is the JSON-serialized table of contents index of the files in the stargz file.
 type jtoc struct {
 	Version int         `json:"version"`
 	Entries []*TOCEntry `json:"entries"`
+}
+
+// Stat returns a FileInfo value representing e.
+func (e *TOCEntry) Stat() os.FileInfo { return fileInfo{e} }
+
+// ForeachChild calls f for each child item. If f returns false, iteration ends.
+// If e is not a directory, f is not called.
+func (e *TOCEntry) ForeachChild(f func(baseName string, ent *TOCEntry) bool) {
+	for name, ent := range e.children {
+		if !f(name, ent) {
+			return
+		}
+	}
+}
+
+// LookupChild returns the directory e's child by its base name.
+func (e *TOCEntry) LookupChild(baseName string) (child *TOCEntry, ok bool) {
+	child, ok = e.children[baseName]
+	return
 }
 
 // fileInfo implements os.FileInfo using the wrapped *TOCEntry.
@@ -232,9 +258,60 @@ func (r *Reader) initFields() {
 			r.chunks[ent.Name] = append(r.chunks[ent.Name], ent)
 		}
 	}
+
+	// Populate children, add implicit directories:
+	for _, ent := range r.toc.Entries {
+		if ent.Type == "chunk" {
+			continue
+		}
+		// add "foo/":
+		//    add "foo" child to "" (creating "" if necessary)
+		//
+		// add "foo/bar/":
+		//    add "bar" child to "foo" (creating "foo" if necessary)
+		//
+		// add "foo/bar.txt":
+		//    add "bar.txt" child to "foo" (creating "foo" if necessary)
+		//
+		// add "a/b/c/d/e/f.txt":
+		//    create "a/b/c/d/e" node
+		//    add "f.txt" child to "e"
+
+		name := ent.Name
+		if ent.Type == "dir" {
+			name = strings.TrimSuffix(name, "/")
+		}
+		pdir := r.getOrCreateDir(parentDir(name))
+		pdir.addChild(path.Base(name), ent)
+	}
+
+}
+
+func parentDir(p string) string {
+	dir, _ := path.Split(p)
+	return strings.TrimSuffix(dir, "/")
+}
+
+func (r *Reader) getOrCreateDir(d string) *TOCEntry {
+	e, ok := r.m[d]
+	if !ok {
+		e = &TOCEntry{
+			Name: d,
+			Type: "dir",
+			Mode: 0755,
+		}
+		r.m[d] = e
+		if d != "" {
+			pdir := r.getOrCreateDir(parentDir(d))
+			pdir.addChild(path.Base(d), e)
+		}
+	}
+	return e
 }
 
 // Lookup returns the Table of Contents entry for the given path.
+//
+// To get the root directory, use the empty string.
 func (r *Reader) Lookup(path string) (e *TOCEntry, ok bool) {
 	if r == nil {
 		return
