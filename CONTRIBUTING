@@ -1,0 +1,11 @@
+To contribute, send a GitHub PR. Unless your change is an obvious fix,
+please open an issue about your bug or feature request first, before
+sending code.
+
+Once you've sent a pull request, a bot will check that you've signed
+the Google CLA:
+
+    https://cla.developers.google.com
+
+There is no mailing list yet; use GitHub issues for now.
+
