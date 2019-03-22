@@ -1,4 +1,4 @@
-module golang.org/x/build/crfs
+module github.com/google/crfs
 
 go 1.12
 

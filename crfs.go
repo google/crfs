@@ -33,7 +33,7 @@ import (
 
 	"bazil.org/fuse"
 	fspkg "bazil.org/fuse/fs"
-	"golang.org/x/build/crfs/stargz"
+	"github.com/google/crfs/stargz"
 )
 
 const debug = false

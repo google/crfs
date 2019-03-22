@@ -14,7 +14,7 @@ import (
 	"os"
 	"strings"
 
-	"golang.org/x/build/crfs/stargz"
+	"github.com/google/crfs/stargz"
 )
 
 var (
