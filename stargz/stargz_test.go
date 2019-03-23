@@ -129,6 +129,39 @@ func TestWriteAndOpen(t *testing.T) {
 				hasFileContentsRange("foo/big.txt", 12, " a big file"),
 			),
 		},
+		{
+			name: "block_char_fifo",
+			in: tarOf(
+				tarEntryFunc(func(w *tar.Writer) error {
+					return w.WriteHeader(&tar.Header{
+						Name:     "b",
+						Typeflag: tar.TypeBlock,
+						Devmajor: 123,
+						Devminor: 456,
+					})
+				}),
+				tarEntryFunc(func(w *tar.Writer) error {
+					return w.WriteHeader(&tar.Header{
+						Name:     "c",
+						Typeflag: tar.TypeChar,
+						Devmajor: 111,
+						Devminor: 222,
+					})
+				}),
+				tarEntryFunc(func(w *tar.Writer) error {
+					return w.WriteHeader(&tar.Header{
+						Name:     "f",
+						Typeflag: tar.TypeFifo,
+					})
+				}),
+			),
+			wantNumGz: 3,
+			want: checks(
+				lookupMatch("b", &TOCEntry{Name: "b", Type: "block", DevMajor: 123, DevMinor: 456}),
+				lookupMatch("c", &TOCEntry{Name: "c", Type: "char", DevMajor: 111, DevMinor: 222}),
+				lookupMatch("f", &TOCEntry{Name: "f", Type: "fifo"}),
+			),
+		},
 	}
 
 	for _, tt := range tests {
@@ -299,6 +332,19 @@ func hasSymlink(file, target string) stargzCheck {
 			}
 		}
 		t.Errorf("symlink %q not found", file)
+	})
+}
+
+func lookupMatch(name string, want *TOCEntry) stargzCheck {
+	return stargzCheckFn(func(t *testing.T, r *Reader) {
+		e, ok := r.Lookup(name)
+		if !ok {
+			t.Fatalf("failed to Lookup entry %q", name)
+		}
+		if !reflect.DeepEqual(e, want) {
+			t.Errorf("entry %q mismatch.\n got: %+v\nwant: %+v\n", name, e, want)
+		}
+
 	})
 }
 

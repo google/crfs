@@ -34,6 +34,7 @@ import (
 	"bazil.org/fuse"
 	fspkg "bazil.org/fuse/fs"
 	"github.com/google/crfs/stargz"
+	"golang.org/x/sys/unix"
 )
 
 const debug = false
@@ -128,8 +129,13 @@ func direntType(ent *stargz.TOCEntry) fuse.DirentType {
 		return fuse.DT_File
 	case "symlink":
 		return fuse.DT_Link
+	case "block":
+		return fuse.DT_Block
+	case "char":
+		return fuse.DT_Char
+	case "fifo":
+		return fuse.DT_FIFO
 	}
-	// TODO: socket, block, char, fifo as needed
 	return fuse.DT_Unknown
 }
 
@@ -160,6 +166,8 @@ func (n *node) Attr(ctx context.Context, a *fuse.Attr) error {
 	a.Mode = fi.Mode()
 	a.Uid = uint32(n.te.Uid)
 	a.Gid = uint32(n.te.Gid)
+	a.Rdev = uint32(unix.Mkdev(uint32(n.te.DevMajor), uint32(n.te.DevMinor)))
+	a.Nlink = 1 // TODO: get this from te once hardlinks are more supported
 	if debug {
 		log.Printf("attr of %s: %s", n.te.Name, *a)
 	}

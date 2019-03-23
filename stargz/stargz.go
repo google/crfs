@@ -107,7 +107,8 @@ type TOCEntry struct {
 	// stored in the tar file, not just the base name.
 	Name string `json:"name"`
 
-	// Type is one of "dir", "reg", "symlink", "hardlink", or "chunk".
+	// Type is one of "dir", "reg", "symlink", "hardlink", "char",
+	// "block", "fifo", or "chunk".
 	// The "chunk" type is used for regular file data chunks past the first
 	// TOCEntry; the 2nd chunk and on have only Type ("chunk"), Offset,
 	// ChunkOffset, and ChunkSize populated.
@@ -150,6 +151,12 @@ type TOCEntry struct {
 	// stargz file to the file's data bytes. See ChunkOffset and
 	// ChunkSize.
 	Offset int64 `json:"offset,omitempty"`
+
+	// DevMajor is the major device number for "char" and "block" types.
+	DevMajor int `json:"devMajor,omitempty"`
+
+	// DevMinor is the major device number for "char" and "block" types.
+	DevMinor int `json:"devMinor,omitempty"`
 
 	// ChunkOffset is non-zero if this is a chunk of a large,
 	// regular file. If so, the Offset is where the gzip header of
@@ -215,7 +222,14 @@ func (fi fileInfo) Mode() (m os.FileMode) {
 		m |= os.ModeDir
 	case "symlink":
 		m |= os.ModeSymlink
+	case "char":
+		m |= os.ModeDevice | os.ModeCharDevice
+	case "block":
+		m |= os.ModeDevice
+	case "fifo":
+		m |= os.ModeNamedPipe
 	}
+	// TODO: ModeSetuid, ModeSetgid, if/as needed.
 	return m
 }
 
@@ -578,6 +592,16 @@ func (w *Writer) AppendTar(r io.Reader) error {
 		case tar.TypeReg:
 			ent.Type = "reg"
 			ent.Size = h.Size
+		case tar.TypeChar:
+			ent.Type = "char"
+			ent.DevMajor = int(h.Devmajor)
+			ent.DevMinor = int(h.Devminor)
+		case tar.TypeBlock:
+			ent.Type = "block"
+			ent.DevMajor = int(h.Devmajor)
+			ent.DevMinor = int(h.Devminor)
+		case tar.TypeFifo:
+			ent.Type = "fifo"
 		default:
 			return fmt.Errorf("unsupported input tar entry %q", h.Typeflag)
 		}
