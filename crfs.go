@@ -70,6 +70,7 @@ func main() {
 		log.Fatal(err)
 	}
 	defer c.Close()
+	defer fuse.Unmount(mntPoint)
 
 	err = fspkg.Serve(c, fs)
 	if err != nil {
