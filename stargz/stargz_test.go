@@ -8,6 +8,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -179,6 +180,12 @@ func TestWriteAndOpen(t *testing.T) {
 			}
 			b := stargzBuf.Bytes()
 
+			diffID := w.DiffID()
+			wantDiffID := diffIDOfGz(t, b)
+			if diffID != wantDiffID {
+				t.Errorf("DiffID = %q; want %q", diffID, wantDiffID)
+			}
+
 			got := countGzStreams(t, b)
 			if got != tt.wantNumGz {
 				t.Errorf("number of gzip streams = %d; want %d", got, tt.wantNumGz)
@@ -193,6 +200,18 @@ func TestWriteAndOpen(t *testing.T) {
 			}
 		})
 	}
+}
+
+func diffIDOfGz(t *testing.T, b []byte) string {
+	h := sha256.New()
+	zr, err := gzip.NewReader(bytes.NewReader(b))
+	if err != nil {
+		t.Fatalf("diffIDOfGz: %v", err)
+	}
+	if _, err := io.Copy(h, zr); err != nil {
+		t.Fatalf("diffIDOfGz.Copy: %v", err)
+	}
+	return fmt.Sprintf("sha256:%x", h.Sum(nil))
 }
 
 func countGzStreams(t *testing.T, b []byte) (numStreams int) {

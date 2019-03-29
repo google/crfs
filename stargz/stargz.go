@@ -14,9 +14,11 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"io/ioutil"
 	"os"
@@ -415,9 +417,10 @@ func (fr *fileReader) ReadAt(p []byte, off int64) (n int, err error) {
 //
 // Use NewWriter to create a new Writer.
 type Writer struct {
-	bw  *bufio.Writer
-	cw  *countWriter
-	toc *jtoc
+	bw       *bufio.Writer
+	cw       *countWriter
+	toc      *jtoc
+	diffHash hash.Hash // SHA-256 of uncompressed tar
 
 	closed        bool
 	gz            *gzip.Writer
@@ -431,11 +434,17 @@ type Writer struct {
 	ChunkSize int
 }
 
-// currentGzipWriter writes to the current w.gz field, can change
-// throughout writing a tar entry.
+// currentGzipWriter writes to the current w.gz field, which can
+// change throughout writing a tar entry.
+//
+// Additionally, it updates w's SHA-256 of the uncompressed bytes
+// of the tar file.
 type currentGzipWriter struct{ w *Writer }
 
-func (cgw currentGzipWriter) Write(p []byte) (int, error) { return cgw.w.gz.Write(p) }
+func (cgw currentGzipWriter) Write(p []byte) (int, error) {
+	cgw.w.diffHash.Write(p)
+	return cgw.w.gz.Write(p)
+}
 
 func (w *Writer) chunkSize() int {
 	if w.ChunkSize <= 0 {
@@ -451,9 +460,10 @@ func NewWriter(w io.Writer) *Writer {
 	bw := bufio.NewWriter(w)
 	cw := &countWriter{w: bw}
 	return &Writer{
-		bw:  bw,
-		cw:  cw,
-		toc: &jtoc{Version: 1},
+		bw:       bw,
+		cw:       cw,
+		toc:      &jtoc{Version: 1},
+		diffHash: sha256.New(),
 	}
 }
 
@@ -473,7 +483,7 @@ func (w *Writer) Close() error {
 	tocOff := w.cw.n
 	w.gz, _ = gzip.NewWriterLevel(w.cw, gzip.BestCompression)
 	w.gz.Extra = []byte("stargz.toc")
-	tw := tar.NewWriter(w.gz)
+	tw := tar.NewWriter(currentGzipWriter{w})
 	tocJSON, err := json.MarshalIndent(w.toc, "", "\t")
 	if err != nil {
 		return err
@@ -644,6 +654,12 @@ func (w *Writer) AppendTar(r io.Reader) error {
 		}
 	}
 	return nil
+}
+
+// DiffID returns the SHA-256 of the uncompressed tar bytes.
+// It is only valid to call DiffID after Close.
+func (w *Writer) DiffID() string {
+	return fmt.Sprintf("sha256:%x", w.diffHash.Sum(nil))
 }
 
 // footerBytes the 47 byte footer.
