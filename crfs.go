@@ -20,14 +20,18 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
+	"net/http"
 	"os"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -35,7 +39,10 @@ import (
 
 	"bazil.org/fuse"
 	fspkg "bazil.org/fuse/fs"
+	"cloud.google.com/go/compute/metadata"
 	"github.com/google/crfs/stargz"
+	namepkg "github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/go-containerregistry/pkg/v1/google"
 	"golang.org/x/sys/unix"
 )
 
@@ -88,6 +95,96 @@ type FS struct {
 // See https://godoc.org/bazil.org/fuse/fs#FS
 func (fs *FS) Root() (fspkg.Node, error) {
 	return &rootNode{fs}, nil
+}
+
+// imagesOfHost returns the images for the given registry host and
+// owner (e.g. GCP project name).
+//
+// Note that this is gcr.io specific as there's no way in the Registry
+// protocol to do this. So this won't work for index.docker.io. We'll
+// need to do something else there.
+// TODO: something else for docker hub.
+func (fs *FS) imagesOfHost(ctx context.Context, host, owner string) (imageNames []string, err error) {
+	req, err := http.NewRequest("GET", "https://"+host+"/v2/"+owner+"/tags/list", nil)
+	if err != nil {
+		return nil, err
+	}
+	// TODO: auth. This works for public stuff so far, though.
+	req = req.WithContext(ctx)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		return nil, errors.New(res.Status)
+	}
+	var resj struct {
+		Images []string `json:"child"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&resj); err != nil {
+		return nil, err
+	}
+	sort.Strings(resj.Images)
+	return resj.Images, nil
+}
+
+type manifest struct {
+	SchemaVersion int        `json:"schemaVersion"`
+	MediaType     string     `json:"mediaType"`
+	Config        *blobRef   `json:"config"`
+	Layers        []*blobRef `json:"layers"`
+}
+
+type blobRef struct {
+	Size      int64  `json:"size"`
+	MediaType string `json:"mediaType"`
+	Digest    string `json:"digest"`
+}
+
+func (fs *FS) getManifest(ctx context.Context, host, owner, image, ref string) (*manifest, error) {
+	urlStr := "https://" + host + "/v2/" + owner + "/" + image + "/manifests/" + ref
+	req, err := http.NewRequest("GET", urlStr, nil)
+	if err != nil {
+		return nil, err
+	}
+	// TODO: auth. This works for public stuff so far, though.
+	req = req.WithContext(ctx)
+	req.Header.Set("Accept", "*") // application/vnd.docker.distribution.manifest.v2+json
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		slurp, _ := ioutil.ReadAll(res.Body)
+		return nil, fmt.Errorf("non-200 for %q: %v, %q", urlStr, res.Status, slurp)
+	}
+	resj := new(manifest)
+	if err := json.NewDecoder(res.Body).Decode(resj); err != nil {
+		return nil, err
+	}
+	return resj, nil
+}
+
+func (fs *FS) getConfig(ctx context.Context, host, owner, image, ref string) (string, error) {
+	urlStr := "https://" + host + "/v2/" + owner + "/" + image + "/blobs/" + ref
+	req, err := http.NewRequest("GET", urlStr, nil)
+	if err != nil {
+		return "", err
+	}
+	req = req.WithContext(ctx)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		slurp, _ := ioutil.ReadAll(res.Body)
+		return "", fmt.Errorf("non-200 for %q: %v, %q", urlStr, res.Status, slurp)
+	}
+	slurp, err := ioutil.ReadAll(res.Body)
+	return string(slurp), err
 }
 
 // rootNode is the contents of /crfs.
@@ -154,6 +251,10 @@ var commonRegistryHostnames = []string{
 	"eu.gcr.io",
 	"asia.gcr.io",
 	"index.docker.io",
+}
+
+func isGCR(host string) bool {
+	return host == "gcr.io" || strings.HasSuffix(host, ".gcr.io")
 }
 
 func (n *layersRoot) ReadDirAll(ctx context.Context) (ents []fuse.Dirent, err error) {
@@ -236,6 +337,199 @@ func (n *layerHost) Attr(ctx context.Context, a *fuse.Attr) error {
 	setDirAttr(a)
 	a.Valid = 15 * time.Second
 	return nil
+}
+
+func (n *layerHost) ReadDirAll(ctx context.Context) (ents []fuse.Dirent, err error) {
+	if isGCR(n.host) && metadata.OnGCE() {
+		if proj, _ := metadata.ProjectID(); proj != "" {
+			ents = append(ents, fuse.Dirent{Type: fuse.DT_Dir, Name: proj})
+		}
+	}
+	return
+}
+
+var gcpProjRE = regexp.MustCompile(`^[a-z]([-a-z0-9]*[a-z0-9])?$`)
+
+func (n *layerHost) Lookup(ctx context.Context, name string) (fspkg.Node, error) {
+	// For gcr.io hosts, the next level lookup is the GCP project name,
+	// which we can validate.
+	if isGCR(n.host) {
+		proj := name
+		if len(name) < 6 || len(name) > 30 || !gcpProjRE.MatchString(proj) {
+			return nil, os.ErrNotExist
+		}
+	}
+	// TODO: validate index.docker.io next level lookups
+	return &layerHostOwner{
+		fs:    n.fs,
+		host:  n.host,
+		owner: name,
+	}, nil
+}
+
+// layerHostOwner is, say, /crfs/layers/gcr.io/foo-proj/
+//
+// Its children are image names in that project.
+type layerHostOwner struct {
+	fs    *FS
+	host  string // "gcr.io"
+	owner string // "foo-proj" (GCP project, docker hub owner)
+}
+
+func (n *layerHostOwner) Attr(ctx context.Context, a *fuse.Attr) error {
+	setDirAttr(a)
+	return nil
+}
+
+func (n *layerHostOwner) ReadDirAll(ctx context.Context) (ents []fuse.Dirent, err error) {
+	images, err := n.fs.imagesOfHost(ctx, n.host, n.owner)
+	if err != nil {
+		return nil, err
+	}
+	for _, name := range images {
+		ents = append(ents, fuse.Dirent{Type: fuse.DT_Dir, Name: name})
+	}
+	return ents, nil
+}
+
+func (n *layerHostOwner) Lookup(ctx context.Context, imageName string) (fspkg.Node, error) {
+	// TODO: auth, dockerhub, context
+	repo, err := namepkg.NewRepository(n.host + "/" + n.owner + "/" + imageName)
+	if err != nil {
+		log.Printf("bad name: %v", err)
+		return nil, err
+	}
+	tags, err := google.List(repo)
+	if err != nil {
+		log.Printf("list: %v", err)
+		return nil, err
+	}
+	m := map[string]string{}
+	for k, mi := range tags.Manifests {
+		for _, tag := range mi.Tags {
+			m[tag] = k
+		}
+	}
+	return &layerHostOwnerImage{
+		fs:      n.fs,
+		host:    n.host,
+		owner:   n.owner,
+		image:   imageName,
+		tags:    tags,
+		tagsMap: m,
+	}, nil
+}
+
+// layerHostOwnerImage is, say, /crfs/layers/gcr.io/foo-proj/ubuntu
+//
+// Its children are specific version of that image (in the form
+// "sha256-7de52a7970a2d0a7d355c76e4f0e02b0e6ebc2841f64040062a27313761cc978",
+// with hyphens instead of colons, for portability).
+//
+// And then also symlinks of tags to said ugly directories.
+type layerHostOwnerImage struct {
+	fs      *FS
+	host    string // "gcr.io"
+	owner   string // "foo-proj" (GCP project, docker hub owner)
+	image   string // "ubuntu"
+	tags    *google.Tags
+	tagsMap map[string]string // "latest" -> "sha256:fooo"
+}
+
+func (n *layerHostOwnerImage) Attr(ctx context.Context, a *fuse.Attr) error {
+	setDirAttr(a)
+	return nil
+}
+
+func uncolon(s string) string { return strings.Replace(s, ":", "-", 1) }
+func recolon(s string) string { return strings.Replace(s, "-", ":", 1) }
+
+func (n *layerHostOwnerImage) ReadDirAll(ctx context.Context) (ents []fuse.Dirent, err error) {
+	for k := range n.tags.Manifests {
+		ents = append(ents, fuse.Dirent{Type: fuse.DT_Dir, Name: uncolon(k)})
+	}
+	for k := range n.tagsMap {
+		ents = append(ents, fuse.Dirent{Type: fuse.DT_Link, Name: k})
+	}
+	return ents, nil
+}
+
+func (n *layerHostOwnerImage) Lookup(ctx context.Context, name string) (fspkg.Node, error) {
+	if targ, ok := n.tagsMap[name]; ok {
+		return symlinkNode(targ), nil
+	}
+
+	withColon := recolon(name)
+	if _, ok := n.tags.Manifests[withColon]; ok {
+		mf, err := n.fs.getManifest(ctx, n.host, n.owner, n.image, withColon)
+		if err != nil {
+			log.Printf("getManifest: %v", err)
+			return nil, err
+		}
+		return &layerHostOwnerImageReference{
+			fs:    n.fs,
+			host:  n.host,
+			owner: n.owner,
+			image: n.image,
+			ref:   withColon,
+			mf:    mf,
+		}, nil
+	}
+	return nil, os.ErrNotExist
+}
+
+// layerHostOwnerImageReference is a specific version of an image:
+// /crfs/layers/gcr.io/foo-proj/ubuntu/sha256-7de52a7970a2d0a7d355c76e4f0e02b0e6ebc2841f64040062a27313761cc978
+type layerHostOwnerImageReference struct {
+	fs    *FS
+	host  string // "gcr.io"
+	owner string // "foo-proj" (GCP project, docker hub owner)
+	image string // "ubuntu"
+	ref   string // "sha256:xxxx" (with colon)
+	mf    *manifest
+}
+
+func (n *layerHostOwnerImageReference) Attr(ctx context.Context, a *fuse.Attr) error {
+	setDirAttr(a)
+	a.Valid = 30 * 24 * time.Hour
+	return nil
+}
+
+func (n *layerHostOwnerImageReference) ReadDirAll(ctx context.Context) (ents []fuse.Dirent, err error) {
+	for i, layer := range n.mf.Layers {
+		ents = append(ents, fuse.Dirent{Type: fuse.DT_Dir, Name: uncolon(layer.Digest)})
+		ents = append(ents, fuse.Dirent{Type: fuse.DT_Link, Name: strconv.Itoa(i)})
+	}
+	ents = append(ents, fuse.Dirent{Type: fuse.DT_File, Name: "config"})
+	return
+}
+
+func (n *layerHostOwnerImageReference) Lookup(ctx context.Context, name string) (fspkg.Node, error) {
+	i, err := strconv.Atoi(name)
+	if err == nil && i >= 0 && i < len(n.mf.Layers) {
+		return symlinkNode(uncolon(n.mf.Layers[i].Digest)), nil
+	}
+	if name == "config" {
+		conf, err := n.fs.getConfig(ctx, n.host, n.owner, n.image, n.mf.Config.Digest)
+		if err != nil {
+			log.Printf("getConfig: %v", err)
+			return nil, err
+		}
+		return &staticFile{conf}, nil
+	}
+	log.Printf("Lookup of %q", name)
+	return nil, errors.New("TODO")
+}
+
+type symlinkNode string // underlying is target
+
+func (s symlinkNode) Attr(ctx context.Context, a *fuse.Attr) error {
+	a.Mode = os.ModeSymlink | 0644
+	return nil
+}
+
+func (s symlinkNode) Readlink(ctx context.Context, req *fuse.ReadlinkRequest) (string, error) {
+	return string(s), nil
 }
 
 // imagesRoot is the contents of /crfs/images/
