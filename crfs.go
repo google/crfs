@@ -24,9 +24,11 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"os"
 	"sort"
+	"strings"
 	"syscall"
 	"time"
 	"unsafe"
@@ -45,8 +47,6 @@ func usage() {
 	flag.PrintDefaults()
 }
 
-var stargzFile = flag.String("test_stargz", "", "local stargz file for testing a single layer mount, without hitting a container registry")
-
 func main() {
 	flag.Parse()
 	mntPoint := "/crfs"
@@ -58,14 +58,6 @@ func main() {
 		mntPoint = flag.Arg(0)
 	}
 
-	if *stargzFile == "" {
-		log.Fatalf("TODO: network mode not done yet. Use --test_stargz for now")
-	}
-	fs, err := NewLocalStargzFileFS(*stargzFile)
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	c, err := fuse.Mount(mntPoint, fuse.FSName("crfs"), fuse.Subtype("crfs"), fuse.ReadOnly())
 	if err != nil {
 		log.Fatal(err)
@@ -73,6 +65,7 @@ func main() {
 	defer c.Close()
 	defer fuse.Unmount(mntPoint)
 
+	fs := new(FS)
 	err = fspkg.Serve(c, fs)
 	if err != nil {
 		log.Fatal(err)
@@ -88,33 +81,210 @@ func main() {
 // FS is the CRFS filesystem.
 // It implements https://godoc.org/bazil.org/fuse/fs#FS
 type FS struct {
-	r *stargz.Reader
-}
-
-func NewLocalStargzFileFS(file string) (*FS, error) {
-	f, err := os.Open(file)
-	if err != nil {
-		return nil, err
-	}
-	fi, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	r, err := stargz.Open(io.NewSectionReader(f, 0, fi.Size()))
-	if err != nil {
-		return nil, err
-	}
-	return &FS{r: r}, nil
+	// TODO: options, probably. logger, etc.
 }
 
 // Root returns the root filesystem node for the CRFS filesystem.
 // See https://godoc.org/bazil.org/fuse/fs#FS
 func (fs *FS) Root() (fspkg.Node, error) {
-	te, ok := fs.r.Lookup("")
+	return &rootNode{fs}, nil
+}
+
+// rootNode is the contents of /crfs.
+// Children include:
+//    layers/ -- individual layers; directories by hostname/user/layer
+//    images/ -- merged layers; directories by hostname/user/layer
+//    README-crfs.txt
+type rootNode struct {
+	fs *FS
+}
+
+func (n *rootNode) Attr(ctx context.Context, a *fuse.Attr) error {
+	setDirAttr(a)
+	a.Valid = 30 * 24 * time.Hour
+	return nil
+}
+
+func (n *rootNode) ReadDirAll(ctx context.Context) (ents []fuse.Dirent, err error) {
+	ents = append(ents,
+		fuse.Dirent{Type: fuse.DT_Dir, Name: "layers"},
+		fuse.Dirent{Type: fuse.DT_Dir, Name: "images"},
+		fuse.Dirent{Type: fuse.DT_File, Name: "README-crfs.txt"},
+	)
+	return
+}
+
+func (n *rootNode) Lookup(ctx context.Context, name string) (fspkg.Node, error) {
+	switch name {
+	case "layers":
+		return &layersRoot{n.fs}, nil
+	case "images":
+		return &imagesRoot{n.fs}, nil
+	case "README-crfs.txt":
+		return &staticFile{"This is CRFS. See https://github.com/google/crfs.\n"}, nil
+	}
+	return nil, os.ErrNotExist
+}
+
+func setDirAttr(a *fuse.Attr) {
+	a.Mode = 0755 | os.ModeDir
+	// TODO: more?
+}
+
+// layersRoot is the contents of /crfs/layers/
+//
+// Its children are hostnames (such as "gcr.io").
+//
+// A special directory, "local", permits walking into stargz files on
+// disk, local to the directory where crfs is running. This is useful for
+// debugging.
+type layersRoot struct {
+	fs *FS
+}
+
+func (n *layersRoot) Attr(ctx context.Context, a *fuse.Attr) error {
+	setDirAttr(a)
+	a.Valid = 30 * 24 * time.Hour
+	return nil
+}
+
+var commonRegistryHostnames = []string{
+	"gcr.io",
+	"us.gcr.io",
+	"eu.gcr.io",
+	"asia.gcr.io",
+	"index.docker.io",
+}
+
+func (n *layersRoot) ReadDirAll(ctx context.Context) (ents []fuse.Dirent, err error) {
+	for _, n := range commonRegistryHostnames {
+		ents = append(ents, fuse.Dirent{Type: fuse.DT_Dir, Name: n})
+	}
+	ents = append(ents, fuse.Dirent{Type: fuse.DT_Dir, Name: "local"})
+	return
+}
+
+func (n *layersRoot) Lookup(ctx context.Context, name string) (fspkg.Node, error) {
+	if name == "local" {
+		return &layerDebugRoot{n.fs}, nil
+	}
+	// TODO: validation that it's a halfway valid looking hostname?
+	return &layerHost{n.fs, name}, nil
+}
+
+// layerDebugRoot is /crfs/layers/local/
+// Its contents are *.star.gz files in the current directory.
+type layerDebugRoot struct {
+	fs *FS
+}
+
+func (n *layerDebugRoot) Attr(ctx context.Context, a *fuse.Attr) error {
+	setDirAttr(a)
+	return nil
+}
+
+func (n *layerDebugRoot) ReadDirAll(ctx context.Context) (ents []fuse.Dirent, err error) {
+	fis, err := ioutil.ReadDir(".")
+	for _, fi := range fis {
+		name := fi.Name()
+		if !strings.HasSuffix(name, ".stargz") {
+			continue
+		}
+		ents = append(ents, fuse.Dirent{Type: fuse.DT_Dir, Name: name})
+	}
+	return ents, err
+}
+
+func (n *layerDebugRoot) Lookup(ctx context.Context, name string) (fspkg.Node, error) {
+	f, err := os.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	r, err := stargz.Open(io.NewSectionReader(f, 0, fi.Size()))
+	if err != nil {
+		f.Close()
+		log.Printf("error opening local stargz: %v", err)
+		return nil, err
+	}
+	root, ok := r.Lookup("")
 	if !ok {
+		f.Close()
 		return nil, errors.New("failed to find root in stargz")
 	}
-	return &node{fs, te}, nil
+	return &node{
+		fs: n.fs,
+		te: root,
+		sr: r,
+		f:  f,
+	}, nil
+}
+
+// layerHost is, say, /crfs/layers/gcr.io/ (with host == "gcr.io")
+//
+// Its children are the next level (GCP project, docker hub owner).
+type layerHost struct {
+	fs   *FS
+	host string
+}
+
+func (n *layerHost) Attr(ctx context.Context, a *fuse.Attr) error {
+	setDirAttr(a)
+	a.Valid = 15 * time.Second
+	return nil
+}
+
+// imagesRoot is the contents of /crfs/images/
+// Its children are hostnames (such as "gcr.io").
+type imagesRoot struct {
+	fs *FS
+}
+
+func (n *imagesRoot) Attr(ctx context.Context, a *fuse.Attr) error {
+	setDirAttr(a)
+	a.Valid = 30 * 24 * time.Hour
+	return nil
+}
+
+func (n *imagesRoot) ReadDirAll(ctx context.Context) (ents []fuse.Dirent, err error) {
+	for _, n := range commonRegistryHostnames {
+		ents = append(ents, fuse.Dirent{Type: fuse.DT_Dir, Name: n})
+	}
+	return
+}
+
+type staticFile struct {
+	contents string
+}
+
+func (f *staticFile) Attr(ctx context.Context, a *fuse.Attr) error {
+	a.Mode = 0644
+	a.Size = uint64(len(f.contents))
+	a.Blocks = blocksOf(a.Size)
+	return nil
+}
+
+func (f *staticFile) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
+	if req.Offset < 0 {
+		return syscall.EINVAL
+	}
+	if req.Offset > int64(len(f.contents)) {
+		resp.Data = nil
+		return nil
+	}
+	bufSize := int64(req.Size)
+	remain := int64(len(f.contents)) - req.Offset
+	if bufSize > remain {
+		bufSize = remain
+	}
+	resp.Data = make([]byte, bufSize)
+	n := copy(resp.Data, f.contents[req.Offset:])
+	resp.Data = resp.Data[:n] // redundant, but for clarity
+	return nil
 }
 
 func inodeOfEnt(ent *stargz.TOCEntry) uint64 {
@@ -144,6 +314,8 @@ func direntType(ent *stargz.TOCEntry) fuse.DirentType {
 type node struct {
 	fs *FS
 	te *stargz.TOCEntry
+	sr *stargz.Reader
+	f  *os.File // non-nil if root & in debug mode
 }
 
 var (
@@ -152,7 +324,16 @@ var (
 	_ fspkg.NodeStringLookuper = (*node)(nil)
 	_ fspkg.NodeReadlinker     = (*node)(nil)
 	_ fspkg.HandleReader       = (*node)(nil)
+	// TODO: implement NodeReleaser and n.f.Close() when n.f is non-nil
 )
+
+func blocksOf(size uint64) (blocks uint64) {
+	blocks = size / 512
+	if size%512 > 0 {
+		blocks++
+	}
+	return
+}
 
 // Attr populates a with the attributes of n.
 // See https://godoc.org/bazil.org/fuse/fs#Node
@@ -161,7 +342,7 @@ func (n *node) Attr(ctx context.Context, a *fuse.Attr) error {
 	a.Valid = 30 * 24 * time.Hour
 	a.Inode = inodeOfEnt(n.te)
 	a.Size = uint64(fi.Size())
-	a.Blocks = a.Size / 512
+	a.Blocks = blocksOf(a.Size)
 	a.Mtime = fi.ModTime()
 	a.Mode = fi.Mode()
 	a.Uid = uint32(n.te.Uid)
@@ -198,7 +379,7 @@ func (n *node) Lookup(ctx context.Context, name string) (fspkg.Node, error) {
 	if !ok {
 		return nil, syscall.ENOENT
 	}
-	return &node{n.fs, e}, nil
+	return &node{n.fs, e, n.sr, nil}, nil
 }
 
 // Readlink reads the target of a symlink.
@@ -215,7 +396,7 @@ func (n *node) Readlink(ctx context.Context, req *fuse.ReadlinkRequest) (string,
 //
 // See https://godoc.org/bazil.org/fuse/fs#HandleReader
 func (n *node) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
-	sr, err := n.fs.r.OpenFile(n.te.Name)
+	sr, err := n.sr.OpenFile(n.te.Name)
 	if err != nil {
 		return err
 	}
