@@ -456,7 +456,7 @@ func (n *layerHostOwnerImage) ReadDirAll(ctx context.Context) (ents []fuse.Diren
 
 func (n *layerHostOwnerImage) Lookup(ctx context.Context, name string) (fspkg.Node, error) {
 	if targ, ok := n.tagsMap[name]; ok {
-		return symlinkNode(targ), nil
+		return symlinkNode(uncolon(targ)), nil
 	}
 
 	withColon := recolon(name)
@@ -500,6 +500,7 @@ func (n *layerHostOwnerImageReference) ReadDirAll(ctx context.Context) (ents []f
 		ents = append(ents, fuse.Dirent{Type: fuse.DT_Dir, Name: uncolon(layer.Digest)})
 		ents = append(ents, fuse.Dirent{Type: fuse.DT_Link, Name: strconv.Itoa(i)})
 	}
+	ents = append(ents, fuse.Dirent{Type: fuse.DT_Link, Name: "topmost"})
 	ents = append(ents, fuse.Dirent{Type: fuse.DT_File, Name: "config"})
 	return
 }
@@ -509,6 +510,9 @@ func (n *layerHostOwnerImageReference) Lookup(ctx context.Context, name string) 
 	if err == nil && i >= 0 && i < len(n.mf.Layers) {
 		return symlinkNode(uncolon(n.mf.Layers[i].Digest)), nil
 	}
+	if name == "topmost" {
+		return symlinkNode(fmt.Sprint(len(n.mf.Layers) - 1)), nil
+	}
 	if name == "config" {
 		conf, err := n.fs.getConfig(ctx, n.host, n.owner, n.image, n.mf.Config.Digest)
 		if err != nil {
@@ -517,8 +521,90 @@ func (n *layerHostOwnerImageReference) Lookup(ctx context.Context, name string) 
 		}
 		return &staticFile{conf}, nil
 	}
-	log.Printf("Lookup of %q", name)
-	return nil, errors.New("TODO")
+
+	refColon := recolon(name)
+	var layerSize int64
+	for _, layer := range n.mf.Layers {
+		if layer.Digest == refColon {
+			layerSize = layer.Size
+			break
+		}
+	}
+	if layerSize == 0 {
+		return nil, os.ErrNotExist
+	}
+
+	// Probe the tar.gz. URL to see if it serves a redirect.
+	//
+	// gcr.io serves a redirect for the layer tar.gz blobs, but only on GET, not HEAD.
+	// So add a Range header to bound response size. gcr.io ignores the Range request header,
+	// but if gcr changes its behavior or we're hitting a different registry implementation,
+	// then we don't want to download the full thing.
+	urlStr := "https://" + n.host + "/v2/" + n.owner + "/" + n.image + "/blobs/" + refColon
+	req, err := http.NewRequest("GET", urlStr, nil)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	req.Header.Set("Range", "bytes=0-1")
+	// TODO: auth
+	res, err := http.DefaultTransport.RoundTrip(req) // NOT DefaultClient; don't want redirects
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode >= 400 {
+		log.Printf("hitting %s: %v", urlStr, res.Status)
+		return nil, syscall.EIO
+	}
+	if redir := res.Header.Get("Location"); redir != "" && res.StatusCode/100 == 3 {
+		urlStr = redir
+	}
+
+	sr := io.NewSectionReader(&urlReaderAt{url: urlStr}, 0, layerSize)
+	r, err := stargz.Open(sr)
+	if err != nil {
+		log.Printf("error opening remote stargz in %s: %v", urlStr, err)
+		return nil, err
+	}
+	root, ok := r.Lookup("")
+	if !ok {
+		return nil, errors.New("failed to find root in stargz")
+	}
+	return &node{
+		fs: n.fs,
+		te: root,
+		sr: r,
+	}, nil
+}
+
+type urlReaderAt struct {
+	url string
+}
+
+func (r *urlReaderAt) ReadAt(p []byte, off int64) (n int, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequest("GET", r.url, nil)
+	if err != nil {
+		return 0, err
+	}
+	req = req.WithContext(ctx)
+	rangeVal := fmt.Sprintf("bytes=%d-%d", off, off+int64(len(p))-1)
+	req.Header.Set("Range", rangeVal)
+	log.Printf("Fetching %s (%d at %d) of %s ...\n", rangeVal, len(p), off, r.url)
+	// TODO: auth
+	res, err := http.DefaultTransport.RoundTrip(req) // NOT DefaultClient; don't want redirects
+	if err != nil {
+		log.Printf("range read of %s: %v", r.url, err)
+		return 0, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusPartialContent {
+		log.Printf("range read of %s: %v", r.url, res.Status)
+		return 0, err
+	}
+	return io.ReadFull(res.Body, p)
 }
 
 type symlinkNode string // underlying is target
