@@ -33,6 +33,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -65,6 +66,7 @@ func main() {
 		mntPoint = flag.Arg(0)
 	}
 
+	log.Printf("crfs: mounting")
 	c, err := fuse.Mount(mntPoint, fuse.FSName("crfs"), fuse.Subtype("crfs"), fuse.ReadOnly())
 	if err != nil {
 		log.Fatal(err)
@@ -72,6 +74,7 @@ func main() {
 	defer c.Close()
 	defer fuse.Unmount(mntPoint)
 
+	log.Printf("crfs: serving")
 	fs := new(FS)
 	err = fspkg.Serve(c, fs)
 	if err != nil {
@@ -500,7 +503,8 @@ func (n *layerHostOwnerImageReference) ReadDirAll(ctx context.Context) (ents []f
 		ents = append(ents, fuse.Dirent{Type: fuse.DT_Dir, Name: uncolon(layer.Digest)})
 		ents = append(ents, fuse.Dirent{Type: fuse.DT_Link, Name: strconv.Itoa(i)})
 	}
-	ents = append(ents, fuse.Dirent{Type: fuse.DT_Link, Name: "topmost"})
+	ents = append(ents, fuse.Dirent{Type: fuse.DT_Link, Name: "top"})
+	ents = append(ents, fuse.Dirent{Type: fuse.DT_Link, Name: "bottom"})
 	ents = append(ents, fuse.Dirent{Type: fuse.DT_File, Name: "config"})
 	return
 }
@@ -510,8 +514,11 @@ func (n *layerHostOwnerImageReference) Lookup(ctx context.Context, name string) 
 	if err == nil && i >= 0 && i < len(n.mf.Layers) {
 		return symlinkNode(uncolon(n.mf.Layers[i].Digest)), nil
 	}
-	if name == "topmost" {
+	if name == "top" {
 		return symlinkNode(fmt.Sprint(len(n.mf.Layers) - 1)), nil
+	}
+	if name == "bottom" {
+		return symlinkNode("0"), nil
 	}
 	if name == "config" {
 		conf, err := n.fs.getConfig(ctx, n.host, n.owner, n.image, n.mf.Config.Digest)
@@ -699,12 +706,14 @@ type node struct {
 }
 
 var (
-	_ fspkg.HandleReadDirAller = (*node)(nil)
 	_ fspkg.Node               = (*node)(nil)
 	_ fspkg.NodeStringLookuper = (*node)(nil)
 	_ fspkg.NodeReadlinker     = (*node)(nil)
-	_ fspkg.HandleReader       = (*node)(nil)
+	_ fspkg.NodeOpener         = (*node)(nil)
 	// TODO: implement NodeReleaser and n.f.Close() when n.f is non-nil
+
+	_ fspkg.HandleReadDirAller = (*nodeHandle)(nil)
+	_ fspkg.HandleReader       = (*nodeHandle)(nil)
 )
 
 func blocksOf(size uint64) (blocks uint64) {
@@ -738,7 +747,8 @@ func (n *node) Attr(ctx context.Context, a *fuse.Attr) error {
 // ReadDirAll returns all directory entries in the directory node n.
 //
 // https://godoc.org/bazil.org/fuse/fs#HandleReadDirAller
-func (n *node) ReadDirAll(ctx context.Context) (ents []fuse.Dirent, err error) {
+func (h *nodeHandle) ReadDirAll(ctx context.Context) (ents []fuse.Dirent, err error) {
+	n := h.n
 	n.te.ForeachChild(func(baseName string, ent *stargz.TOCEntry) bool {
 		ents = append(ents, fuse.Dirent{
 			Inode: inodeOfEnt(ent),
@@ -772,20 +782,87 @@ func (n *node) Readlink(ctx context.Context, req *fuse.ReadlinkRequest) (string,
 	return n.te.LinkName, nil
 }
 
-// Read reads data from a regular file n.
-//
-// See https://godoc.org/bazil.org/fuse/fs#HandleReader
-func (n *node) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
-	sr, err := n.sr.OpenFile(n.te.Name)
-	if err != nil {
-		return err
+func (n *node) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (fspkg.Handle, error) {
+	h := &nodeHandle{
+		n:     n,
+		isDir: req.Dir,
 	}
+	resp.Handle = h.HandleID()
+	if !req.Dir {
+		var err error
+		h.sr, err = n.sr.OpenFile(n.te.Name)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return h, nil
+}
+
+// nodeHandle is a node that's been opened (opendir or for read).
+type nodeHandle struct {
+	n     *node
+	isDir bool
+	sr    *io.SectionReader // of file bytes
+
+	mu            sync.Mutex
+	lastChunkOff  int64
+	lastChunkSize int
+	lastChunk     []byte
+}
+
+func (h *nodeHandle) HandleID() fuse.HandleID {
+	return fuse.HandleID(uintptr(unsafe.Pointer(h)))
+}
+
+func (h *nodeHandle) chunkData(offset int64, size int) ([]byte, error) {
+	h.mu.Lock()
+	if h.lastChunkOff == offset && h.lastChunkSize == size {
+		defer h.mu.Unlock()
+		if debug {
+			log.Printf("cache HIT, chunk off=%d/size=%d", offset, size)
+		}
+		return h.lastChunk, nil
+	}
+	h.mu.Unlock()
+
+	log.Printf("reading chunk for offset=%d, size=%d", offset, size)
+	buf := make([]byte, size)
+	n, err := h.sr.ReadAt(buf, offset)
+	log.Printf("... ReadAt = %v, %v", n, err)
+	if err == nil {
+		h.mu.Lock()
+		h.lastChunkOff = offset
+		h.lastChunkSize = size
+		h.lastChunk = buf
+		h.mu.Unlock()
+	}
+	return buf, err
+}
+
+// See https://godoc.org/bazil.org/fuse/fs#HandleReader
+func (h *nodeHandle) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
+	n := h.n
 
 	resp.Data = make([]byte, req.Size)
-	nr, err := sr.ReadAt(resp.Data, req.Offset)
-	if nr < req.Size {
-		resp.Data = resp.Data[:nr]
+	nr := 0
+	offset := req.Offset
+	for nr < req.Size {
+		ce, ok := n.sr.ChunkEntryForOffset(n.te.Name, offset+int64(nr))
+		if !ok {
+			break
+		}
+		if debug {
+			log.Printf("need chunk data for %q at %d (size=%d, for chunk from log %d-%d (%d), phys %d-%d (%d)) ...",
+				n.te.Name, req.Offset, req.Size, ce.ChunkOffset, ce.ChunkOffset+ce.ChunkSize, ce.ChunkSize, ce.Offset, ce.NextOffset(), ce.NextOffset()-ce.Offset)
+		}
+		chunkData, err := h.chunkData(ce.ChunkOffset, int(ce.ChunkSize))
+		if err != nil {
+			return err
+		}
+		n := copy(resp.Data[nr:], chunkData)
+		nr += n
 	}
+	resp.Data = resp.Data[:nr]
 	if debug {
 		log.Printf("Read response: size=%d @ %d, read %d", req.Size, req.Offset, nr)
 	}

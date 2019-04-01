@@ -87,6 +87,7 @@ func TestWriteAndOpen(t *testing.T) {
 				hasFileLen("foo/bar.txt", len(content)),
 				entryHasChildren("", "bar", "foo"),
 				entryHasChildren("foo", "bar.txt"),
+				hasChunkEntries("foo/bar.txt", 1),
 			),
 		},
 		{
@@ -128,6 +129,7 @@ func TestWriteAndOpen(t *testing.T) {
 				hasFileContentsRange("foo/big.txt", 10, "ch a big file"),
 				hasFileContentsRange("foo/big.txt", 11, "h a big file"),
 				hasFileContentsRange("foo/big.txt", 12, " a big file"),
+				hasChunkEntries("foo/big.txt", 6),
 			),
 		},
 		{
@@ -198,6 +200,7 @@ func TestWriteAndOpen(t *testing.T) {
 			for _, want := range tt.want {
 				want.check(t, r)
 			}
+
 		})
 	}
 }
@@ -301,6 +304,50 @@ func hasFileContentsRange(file string, offset int, want string) stargzCheck {
 		}
 		if string(got) != want {
 			t.Fatalf("ReadAt(len %d, offset %d) = %q, want %q", len(got), offset, got, want)
+		}
+	})
+}
+
+func hasChunkEntries(file string, wantChunks int) stargzCheck {
+	return stargzCheckFn(func(t *testing.T, r *Reader) {
+		ent, ok := r.Lookup(file)
+		if !ok {
+			t.Fatalf("no file for %q", file)
+		}
+		if ent.Type != "reg" {
+			t.Fatalf("file %q has unexpected type %q; want reg", file, ent.Type)
+		}
+		chunks := r.getChunks(ent)
+		if len(chunks) != wantChunks {
+			t.Errorf("len(r.getChunks(%q)) = %d; want %d", file, len(chunks), wantChunks)
+			return
+		}
+		f := chunks[0]
+
+		var gotChunks []*TOCEntry
+		var last *TOCEntry
+		for off := int64(0); off < f.Size; off++ {
+			e, ok := r.ChunkEntryForOffset(file, off)
+			if !ok {
+				t.Errorf("no ChunkEntryForOffset at %d", off)
+				return
+			}
+			if last != e {
+				gotChunks = append(gotChunks, e)
+				last = e
+			}
+		}
+		if !reflect.DeepEqual(chunks, gotChunks) {
+			t.Errorf("gotChunks=%d, want=%d; contents mismatch", len(gotChunks), wantChunks)
+		}
+
+		// And verify the NextOffset
+		for i := 0; i < len(gotChunks)-1; i++ {
+			ci := gotChunks[i]
+			cnext := gotChunks[i+1]
+			if ci.NextOffset() != cnext.Offset {
+				t.Errorf("chunk %d NextOffset %d != next chunk's Offset of %d", i, ci.NextOffset(), cnext.Offset)
+			}
 		}
 	})
 }
