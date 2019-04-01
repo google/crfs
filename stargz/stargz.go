@@ -154,6 +154,8 @@ type TOCEntry struct {
 	// ChunkSize.
 	Offset int64 `json:"offset,omitempty"`
 
+	nextOffset int64 // the Offset of the next entry with a non-zero Offset
+
 	// DevMajor is the major device number for "char" and "block" types.
 	DevMajor int `json:"devMajor,omitempty"`
 
@@ -162,10 +164,13 @@ type TOCEntry struct {
 
 	// ChunkOffset is non-zero if this is a chunk of a large,
 	// regular file. If so, the Offset is where the gzip header of
-	// ChunkSize bytes at ChunkOffset in Name begin. If both
-	// ChunkOffset and ChunkSize are zero, the file contents are
-	// completely represented at the tar gzip stream starting at
-	// Offset.
+	// ChunkSize bytes at ChunkOffset in Name begin.
+	//
+	// In serialized form, a "chunkSize" JSON field of zero means
+	// that the chunk goes to the end of the file. After reading
+	// from the stargz TOC, though, the ChunkSize is initialized
+	// to a non-zero file for when Type is either "reg" or
+	// "chunk".
 	ChunkOffset int64 `json:"chunkOffset,omitempty"`
 	ChunkSize   int64 `json:"chunkSize,omitempty"`
 
@@ -175,12 +180,20 @@ type TOCEntry struct {
 // ModTime returns the entry's modification time.
 func (e *TOCEntry) ModTime() time.Time { return e.modTime }
 
+// NextOffset returns the position (relative to the start of the
+// stargz file) of the next gzip boundary after e.Offset.
+func (e *TOCEntry) NextOffset() int64 { return e.nextOffset }
+
 func (e *TOCEntry) addChild(baseName string, child *TOCEntry) {
 	if e.children == nil {
 		e.children = make(map[string]*TOCEntry)
 	}
 	e.children[baseName] = child
 }
+
+// isDataType reports whether TOCEntry is a regular file or chunk (something that
+// contains regular file data).
+func (e *TOCEntry) isDataType() bool { return e.Type == "reg" || e.Type == "chunk" }
 
 // jtoc is the JSON-serialized table of contents index of the files in the stargz file.
 type jtoc struct {
@@ -246,11 +259,18 @@ func (r *Reader) initFields() {
 	var lastPath string
 	uname := map[int]string{}
 	gname := map[int]string{}
+	var lastRegEnt *TOCEntry
 	for _, ent := range r.toc.Entries {
 		ent.Name = strings.TrimPrefix(ent.Name, "./")
+		if ent.Type == "reg" {
+			lastRegEnt = ent
+		}
 		if ent.Type == "chunk" {
 			ent.Name = lastPath
 			r.chunks[ent.Name] = append(r.chunks[ent.Name], ent)
+			if ent.ChunkSize == 0 && lastRegEnt != nil {
+				ent.ChunkSize = lastRegEnt.Size - ent.ChunkOffset
+			}
 		} else {
 			lastPath = ent.Name
 
@@ -272,6 +292,9 @@ func (r *Reader) initFields() {
 		if ent.Type == "reg" && ent.ChunkSize > 0 && ent.ChunkSize < ent.Size {
 			r.chunks[ent.Name] = make([]*TOCEntry, 0, ent.Size/ent.ChunkSize+1)
 			r.chunks[ent.Name] = append(r.chunks[ent.Name], ent)
+		}
+		if ent.ChunkSize == 0 && ent.Size != 0 {
+			ent.ChunkSize = ent.Size
 		}
 	}
 
@@ -301,6 +324,16 @@ func (r *Reader) initFields() {
 		pdir.addChild(path.Base(name), ent)
 	}
 
+	lastOffset := r.sr.Size()
+	for i := len(r.toc.Entries) - 1; i >= 0; i-- {
+		e := r.toc.Entries[i]
+		if e.isDataType() {
+			e.nextOffset = lastOffset
+		}
+		if e.Offset != 0 {
+			lastOffset = e.Offset
+		}
+	}
 }
 
 func parentDir(p string) string {
@@ -323,6 +356,27 @@ func (r *Reader) getOrCreateDir(d string) *TOCEntry {
 		}
 	}
 	return e
+}
+
+// ChunkEntryForOffset returns the TOCEntry containing the byte of the
+// named file at the given offset within the file.
+func (r *Reader) ChunkEntryForOffset(name string, offset int64) (e *TOCEntry, ok bool) {
+	e, ok = r.Lookup(name)
+	if !ok || !e.isDataType() {
+		return nil, false
+	}
+	ents := r.chunks[name]
+	if len(ents) < 2 {
+		return e, true
+	}
+	i := sort.Search(len(ents), func(i int) bool {
+		e := ents[i]
+		return e.ChunkOffset >= offset || (offset > e.ChunkOffset && offset < e.ChunkOffset+e.ChunkSize)
+	})
+	if i == len(ents) {
+		return nil, false
+	}
+	return ents[i], true
 }
 
 // Lookup returns the Table of Contents entry for the given path.
@@ -359,12 +413,16 @@ func (r *Reader) OpenFile(name string) (*io.SectionReader, error) {
 	fr := &fileReader{
 		r:    r,
 		size: ent.Size,
-		ents: []*TOCEntry{ent},
-	}
-	if ents, ok := r.chunks[name]; ok {
-		fr.ents = ents
+		ents: r.getChunks(ent),
 	}
 	return io.NewSectionReader(fr, 0, fr.size), nil
+}
+
+func (r *Reader) getChunks(ent *TOCEntry) []*TOCEntry {
+	if ents, ok := r.chunks[ent.Name]; ok {
+		return ents
+	}
+	return []*TOCEntry{ent}
 }
 
 type fileReader struct {
@@ -401,9 +459,26 @@ func (fr *fileReader) ReadAt(p []byte, off int64) (n int, err error) {
 	//  offset by the chunk's offset.
 	off -= ent.ChunkOffset
 
+	finalEnt := fr.ents[len(fr.ents)-1]
 	gzOff := ent.Offset
-	sr := io.NewSectionReader(fr.r.sr, gzOff, fr.r.sr.Size()-gzOff)
-	gz, err := gzip.NewReader(sr)
+	// gzBytesRemain is the number of compressed gzip bytes in this
+	// file remaining, over 1+ gzip chunks.
+	gzBytesRemain := finalEnt.NextOffset() - gzOff
+
+	sr := io.NewSectionReader(fr.r.sr, gzOff, gzBytesRemain)
+
+	const maxGZread = 2 << 20
+	var bufSize int = maxGZread
+	if gzBytesRemain < maxGZread {
+		bufSize = int(gzBytesRemain)
+	}
+
+	br := bufio.NewReaderSize(sr, bufSize)
+	if _, err := br.Peek(bufSize); err != nil {
+		return 0, fmt.Errorf("fileReader.ReadAt.peek: %v", err)
+	}
+
+	gz, err := gzip.NewReader(br)
 	if err != nil {
 		return 0, fmt.Errorf("fileReader.ReadAt.gzipNewReader: %v", err)
 	}
