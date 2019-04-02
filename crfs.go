@@ -67,7 +67,7 @@ func main() {
 	}
 
 	log.Printf("crfs: mounting")
-	c, err := fuse.Mount(mntPoint, fuse.FSName("crfs"), fuse.Subtype("crfs"), fuse.ReadOnly())
+	c, err := fuse.Mount(mntPoint, fuse.FSName("crfs"), fuse.Subtype("crfs"), fuse.ReadOnly(), fuse.AllowOther())
 	if err != nil {
 		log.Fatal(err)
 	}
