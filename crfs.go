@@ -34,6 +34,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -48,6 +49,10 @@ import (
 )
 
 const debug = false
+
+var (
+	fuseDebug = flag.Bool("fuse_debug", false, "enable verbose FUSE debugging")
+)
 
 func usage() {
 	fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
@@ -64,6 +69,11 @@ func main() {
 	}
 	if flag.NArg() == 1 {
 		mntPoint = flag.Arg(0)
+	}
+	if *fuseDebug {
+		fuse.Debug = func(msg interface{}) {
+			log.Printf("fuse debug: %v", msg)
+		}
 	}
 
 	log.Printf("crfs: mounting")
@@ -97,7 +107,32 @@ type FS struct {
 // Root returns the root filesystem node for the CRFS filesystem.
 // See https://godoc.org/bazil.org/fuse/fs#FS
 func (fs *FS) Root() (fspkg.Node, error) {
-	return &rootNode{fs}, nil
+	return &rootNode{
+		fs: fs,
+		dirEnts: dirEnts{initChildren: func(de *dirEnts) {
+			de.m["layers"] = &dirEnt{
+				dtype: fuse.DT_Dir,
+				lookupNode: func(inode uint64) (fspkg.Node, error) {
+					return newLayersRoot(fs, inode), nil
+				},
+			}
+			de.m["images"] = &dirEnt{
+				dtype: fuse.DT_Dir,
+				lookupNode: func(inode uint64) (fspkg.Node, error) {
+					return &imagesRoot{fs: fs, inode: inode}, nil
+				},
+			}
+			de.m["README-crfs.txt"] = &dirEnt{
+				dtype: fuse.DT_File,
+				lookupNode: func(inode uint64) (fspkg.Node, error) {
+					return &staticFile{
+						inode:    inode,
+						contents: "This is CRFS. See https://github.com/google/crfs.\n",
+					}, nil
+				},
+			}
+		}},
+	}, nil
 }
 
 // imagesOfHost returns the images for the given registry host and
@@ -190,6 +225,109 @@ func (fs *FS) getConfig(ctx context.Context, host, owner, image, ref string) (st
 	return string(slurp), err
 }
 
+type dirEnt struct {
+	lazyInode
+	dtype      fuse.DirentType
+	lookupNode func(inode uint64) (fspkg.Node, error)
+}
+
+type dirEnts struct {
+	initOnce     sync.Once
+	initChildren func(*dirEnts)
+	mu           sync.Mutex
+	m            map[string]*dirEnt
+}
+
+func (de *dirEnts) Lookup(ctx context.Context, name string) (fspkg.Node, error) {
+	de.condInit()
+	de.mu.Lock()
+	defer de.mu.Unlock()
+	e, ok := de.m[name]
+	if !ok {
+		log.Printf("returning ENOENT for name %q", name)
+		return nil, fuse.ENOENT
+	}
+	if e.lookupNode == nil {
+		log.Printf("node %q has no lookupNode defined", name)
+		return nil, fuse.ENOENT
+	}
+	return e.lookupNode(e.inode())
+}
+
+func (de *dirEnts) ReadDirAll(ctx context.Context) (ents []fuse.Dirent, err error) {
+	de.condInit()
+	de.mu.Lock()
+	defer de.mu.Unlock()
+	ents = make([]fuse.Dirent, 0, len(de.m))
+	for name, e := range de.m {
+		ents = append(ents, fuse.Dirent{
+			Name:  name,
+			Inode: e.inode(),
+			Type:  e.dtype,
+		})
+	}
+	sort.Slice(ents, func(i, j int) bool { return ents[i].Name < ents[j].Name })
+	return ents, nil
+}
+
+func (de *dirEnts) condInit() { de.initOnce.Do(de.doInit) }
+func (de *dirEnts) doInit() {
+	de.m = map[string]*dirEnt{}
+	if de.initChildren != nil {
+		de.initChildren(de)
+	}
+}
+
+// atomicInodeIncr holds the most previously allocate global inode number.
+// It should only be accessed/incremented with sync/atomic.
+var atomicInodeIncr uint32
+
+// lazyInode is a lazily-allocated inode number.
+//
+// We only use 32 bits out of 64 to leave room for overlayfs to play
+// games with the upper bits. TODO: maybe that's not necessary.
+type lazyInode struct{ v uint32 }
+
+func (si *lazyInode) inode() uint64 {
+	for {
+		v := atomic.LoadUint32(&si.v)
+		if v != 0 {
+			return uint64(v)
+		}
+		v = atomic.AddUint32(&atomicInodeIncr, 1)
+		if atomic.CompareAndSwapUint32(&si.v, 0, v) {
+			return uint64(v)
+		}
+	}
+}
+
+// childInodeNumberCache is a temporary, lazily solution to having
+// stable inode numbers in node types where we haven't yet pushed it
+// down properly. This map grows forever (which is bad) and maps the
+// tuple (parent directory inode, child name string) to the child's
+// inode number. Its map key type is inodeAndString
+var childInodeNumberCache sync.Map
+
+type inodeAndString struct {
+	inode     uint64
+	childName string
+}
+
+func getOrMakeChildInode(inode uint64, childName string) uint64 {
+	key := inodeAndString{inode, childName}
+	if v, ok := childInodeNumberCache.Load(key); ok {
+		log.Printf("re-using inode %v/%q = %v", inode, childName, v)
+		return v.(uint64)
+	}
+	actual, loaded := childInodeNumberCache.LoadOrStore(key, uint64(atomic.AddUint32(&atomicInodeIncr, 1)))
+	if loaded {
+		log.Printf("race lost creating inode %v/%q = %v", inode, childName, actual)
+	} else {
+		log.Printf("created inode %v/%q = %v", inode, childName, actual)
+	}
+	return actual.(uint64)
+}
+
 // rootNode is the contents of /crfs.
 // Children include:
 //    layers/ -- individual layers; directories by hostname/user/layer
@@ -197,33 +335,15 @@ func (fs *FS) getConfig(ctx context.Context, host, owner, image, ref string) (st
 //    README-crfs.txt
 type rootNode struct {
 	fs *FS
+	dirEnts
+	lazyInode
 }
 
 func (n *rootNode) Attr(ctx context.Context, a *fuse.Attr) error {
 	setDirAttr(a)
+	a.Inode = n.inode()
 	a.Valid = 30 * 24 * time.Hour
 	return nil
-}
-
-func (n *rootNode) ReadDirAll(ctx context.Context) (ents []fuse.Dirent, err error) {
-	ents = append(ents,
-		fuse.Dirent{Type: fuse.DT_Dir, Name: "layers"},
-		fuse.Dirent{Type: fuse.DT_Dir, Name: "images"},
-		fuse.Dirent{Type: fuse.DT_File, Name: "README-crfs.txt"},
-	)
-	return
-}
-
-func (n *rootNode) Lookup(ctx context.Context, name string) (fspkg.Node, error) {
-	switch name {
-	case "layers":
-		return &layersRoot{n.fs}, nil
-	case "images":
-		return &imagesRoot{n.fs}, nil
-	case "README-crfs.txt":
-		return &staticFile{"This is CRFS. See https://github.com/google/crfs.\n"}, nil
-	}
-	return nil, os.ErrNotExist
 }
 
 func setDirAttr(a *fuse.Attr) {
@@ -239,12 +359,31 @@ func setDirAttr(a *fuse.Attr) {
 // disk, local to the directory where crfs is running. This is useful for
 // debugging.
 type layersRoot struct {
-	fs *FS
+	fs    *FS
+	inode uint64
+	dirEnts
+}
+
+func newLayersRoot(fs *FS, inode uint64) *layersRoot {
+	lr := &layersRoot{fs: fs, inode: inode}
+	lr.dirEnts.initChildren = func(de *dirEnts) {
+		de.m["local"] = &dirEnt{
+			dtype: fuse.DT_Dir,
+			lookupNode: func(inode uint64) (fspkg.Node, error) {
+				return &layerDebugRoot{fs: fs, inode: inode}, nil
+			},
+		}
+		for _, n := range commonRegistryHostnames {
+			lr.addHostDirLocked(n)
+		}
+	}
+	return lr
 }
 
 func (n *layersRoot) Attr(ctx context.Context, a *fuse.Attr) error {
 	setDirAttr(a)
 	a.Valid = 30 * 24 * time.Hour
+	a.Inode = n.inode
 	return nil
 }
 
@@ -260,30 +399,39 @@ func isGCR(host string) bool {
 	return host == "gcr.io" || strings.HasSuffix(host, ".gcr.io")
 }
 
-func (n *layersRoot) ReadDirAll(ctx context.Context) (ents []fuse.Dirent, err error) {
-	for _, n := range commonRegistryHostnames {
-		ents = append(ents, fuse.Dirent{Type: fuse.DT_Dir, Name: n})
+func (n *layersRoot) addHostDirLocked(name string) {
+	n.dirEnts.m[name] = &dirEnt{
+		dtype: fuse.DT_Dir,
+		lookupNode: func(inode uint64) (fspkg.Node, error) {
+			return newLayerHost(n.fs, name, inode), nil
+		},
 	}
-	ents = append(ents, fuse.Dirent{Type: fuse.DT_Dir, Name: "local"})
-	return
 }
 
 func (n *layersRoot) Lookup(ctx context.Context, name string) (fspkg.Node, error) {
-	if name == "local" {
-		return &layerDebugRoot{n.fs}, nil
+	child, err := n.dirEnts.Lookup(ctx, name)
+	if err != fuse.ENOENT {
+		return child, err
 	}
-	// TODO: validation that it's a halfway valid looking hostname?
-	return &layerHost{n.fs, name}, nil
+	// TODO: validate name looks like a hostname?
+	n.dirEnts.mu.Lock()
+	if _, ok := n.dirEnts.m[name]; !ok {
+		n.addHostDirLocked(name)
+	}
+	n.dirEnts.mu.Unlock()
+	return n.dirEnts.Lookup(ctx, name)
 }
 
 // layerDebugRoot is /crfs/layers/local/
 // Its contents are *.star.gz files in the current directory.
 type layerDebugRoot struct {
-	fs *FS
+	fs    *FS
+	inode uint64
 }
 
 func (n *layerDebugRoot) Attr(ctx context.Context, a *fuse.Attr) error {
 	setDirAttr(a)
+	a.Inode = n.inode
 	return nil
 }
 
@@ -294,6 +442,7 @@ func (n *layerDebugRoot) ReadDirAll(ctx context.Context) (ents []fuse.Dirent, er
 		if !strings.HasSuffix(name, ".stargz") {
 			continue
 		}
+		// TODO: populate inode number
 		ents = append(ents, fuse.Dirent{Type: fuse.DT_Dir, Name: name})
 	}
 	return ents, err
@@ -330,44 +479,80 @@ func (n *layerDebugRoot) Lookup(ctx context.Context, name string) (fspkg.Node, e
 
 // layerHost is, say, /crfs/layers/gcr.io/ (with host == "gcr.io")
 //
-// Its children are the next level (GCP project, docker hub owner).
+// Its children are the next level (GCP project, docker hub owner), a layerHostOwner.
 type layerHost struct {
-	fs   *FS
-	host string
+	fs    *FS
+	host  string
+	inode uint64
+	dirEnts
+}
+
+func newLayerHost(fs *FS, host string, inode uint64) *layerHost {
+	n := &layerHost{
+		fs:    fs,
+		host:  host,
+		inode: inode,
+	}
+	n.dirEnts = dirEnts{
+		initChildren: func(de *dirEnts) {
+			if !isGCR(n.host) || !metadata.OnGCE() {
+				return
+			}
+			if proj, _ := metadata.ProjectID(); proj != "" {
+				n.addLayerHostOwnerLocked(proj)
+			}
+		},
+	}
+	return n
 }
 
 func (n *layerHost) Attr(ctx context.Context, a *fuse.Attr) error {
 	setDirAttr(a)
 	a.Valid = 15 * time.Second
+	a.Inode = n.inode
 	return nil
-}
-
-func (n *layerHost) ReadDirAll(ctx context.Context) (ents []fuse.Dirent, err error) {
-	if isGCR(n.host) && metadata.OnGCE() {
-		if proj, _ := metadata.ProjectID(); proj != "" {
-			ents = append(ents, fuse.Dirent{Type: fuse.DT_Dir, Name: proj})
-		}
-	}
-	return
 }
 
 var gcpProjRE = regexp.MustCompile(`^[a-z]([-a-z0-9]*[a-z0-9])?$`)
 
+func (n *layerHost) addLayerHostOwnerLocked(owner string) { // owner == GCP project on gcr.io
+	n.dirEnts.m[owner] = &dirEnt{
+		dtype: fuse.DT_Dir,
+		lookupNode: func(inode uint64) (fspkg.Node, error) {
+			return &layerHostOwner{
+				fs:    n.fs,
+				host:  n.host,
+				owner: owner,
+				inode: inode,
+			}, nil
+		},
+	}
+}
+
 func (n *layerHost) Lookup(ctx context.Context, name string) (fspkg.Node, error) {
+	child, err := n.dirEnts.Lookup(ctx, name)
+	if err != fuse.ENOENT {
+		return child, err
+	}
+
 	// For gcr.io hosts, the next level lookup is the GCP project name,
 	// which we can validate.
 	if isGCR(n.host) {
 		proj := name
 		if len(name) < 6 || len(name) > 30 || !gcpProjRE.MatchString(proj) {
-			return nil, os.ErrNotExist
+			return nil, fuse.ENOENT
 		}
+	} else {
+		// TODO: validate index.docker.io next level lookups
 	}
-	// TODO: validate index.docker.io next level lookups
-	return &layerHostOwner{
-		fs:    n.fs,
-		host:  n.host,
-		owner: name,
-	}, nil
+
+	n.dirEnts.mu.Lock()
+	if _, ok := n.dirEnts.m[name]; !ok {
+		n.addLayerHostOwnerLocked(name)
+	}
+	n.dirEnts.mu.Unlock()
+
+	return n.dirEnts.Lookup(ctx, name)
 }
 
 // layerHostOwner is, say, /crfs/layers/gcr.io/foo-proj/
@@ -375,12 +560,14 @@ func (n *layerHost) Lookup(ctx context.Context, name string) (fspkg.Node, error)
 // Its children are image names in that project.
 type layerHostOwner struct {
 	fs    *FS
+	inode uint64
 	host  string // "gcr.io"
 	owner string // "foo-proj" (GCP project, docker hub owner)
 }
 
 func (n *layerHostOwner) Attr(ctx context.Context, a *fuse.Attr) error {
 	setDirAttr(a)
+	a.Inode = n.inode
 	return nil
 }
 
@@ -415,6 +602,7 @@ func (n *layerHostOwner) Lookup(ctx context.Context, imageName string) (fspkg.No
 	}
 	return &layerHostOwnerImage{
 		fs:      n.fs,
+		inode:   getOrMakeChildInode(n.inode, imageName),
 		host:    n.host,
 		owner:   n.owner,
 		image:   imageName,
@@ -432,6 +620,7 @@ func (n *layerHostOwner) Lookup(ctx context.Context, imageName string) (fspkg.No
 // And then also symlinks of tags to said ugly directories.
 type layerHostOwnerImage struct {
 	fs      *FS
+	inode   uint64
 	host    string // "gcr.io"
 	owner   string // "foo-proj" (GCP project, docker hub owner)
 	image   string // "ubuntu"
@@ -441,6 +630,7 @@ type layerHostOwnerImage struct {
 
 func (n *layerHostOwnerImage) Attr(ctx context.Context, a *fuse.Attr) error {
 	setDirAttr(a)
+	a.Inode = n.inode
 	return nil
 }
 
@@ -471,6 +661,7 @@ func (n *layerHostOwnerImage) Lookup(ctx context.Context, name string) (fspkg.No
 		}
 		return &layerHostOwnerImageReference{
 			fs:    n.fs,
+			inode: getOrMakeChildInode(n.inode, name),
 			host:  n.host,
 			owner: n.owner,
 			image: n.image,
@@ -478,13 +669,14 @@ func (n *layerHostOwnerImage) Lookup(ctx context.Context, name string) (fspkg.No
 			mf:    mf,
 		}, nil
 	}
-	return nil, os.ErrNotExist
+	return nil, fuse.ENOENT
 }
 
 // layerHostOwnerImageReference is a specific version of an image:
 // /crfs/layers/gcr.io/foo-proj/ubuntu/sha256-7de52a7970a2d0a7d355c76e4f0e02b0e6ebc2841f64040062a27313761cc978
 type layerHostOwnerImageReference struct {
 	fs    *FS
+	inode uint64
 	host  string // "gcr.io"
 	owner string // "foo-proj" (GCP project, docker hub owner)
 	image string // "ubuntu"
@@ -495,6 +687,7 @@ type layerHostOwnerImageReference struct {
 func (n *layerHostOwnerImageReference) Attr(ctx context.Context, a *fuse.Attr) error {
 	setDirAttr(a)
 	a.Valid = 30 * 24 * time.Hour
+	a.Inode = n.inode
 	return nil
 }
 
@@ -526,7 +719,7 @@ func (n *layerHostOwnerImageReference) Lookup(ctx context.Context, name string) 
 			log.Printf("getConfig: %v", err)
 			return nil, err
 		}
-		return &staticFile{conf}, nil
+		return &staticFile{contents: conf}, nil // TODO: add inode for staticFile
 	}
 
 	refColon := recolon(name)
@@ -538,7 +731,7 @@ func (n *layerHostOwnerImageReference) Lookup(ctx context.Context, name string) 
 		}
 	}
 	if layerSize == 0 {
-		return nil, os.ErrNotExist
+		return nil, fuse.ENOENT
 	}
 
 	// Probe the tar.gz. URL to see if it serves a redirect.
@@ -618,6 +811,7 @@ type symlinkNode string // underlying is target
 
 func (s symlinkNode) Attr(ctx context.Context, a *fuse.Attr) error {
 	a.Mode = os.ModeSymlink | 0644
+	// TODO: inode
 	return nil
 }
 
@@ -628,12 +822,14 @@ func (s symlinkNode) Readlink(ctx context.Context, req *fuse.ReadlinkRequest) (s
 // imagesRoot is the contents of /crfs/images/
 // Its children are hostnames (such as "gcr.io").
 type imagesRoot struct {
-	fs *FS
+	fs    *FS
+	inode uint64
 }
 
 func (n *imagesRoot) Attr(ctx context.Context, a *fuse.Attr) error {
 	setDirAttr(a)
 	a.Valid = 30 * 24 * time.Hour
+	a.Inode = n.inode
 	return nil
 }
 
@@ -646,10 +842,12 @@ func (n *imagesRoot) ReadDirAll(ctx context.Context) (ents []fuse.Dirent, err er
 
 type staticFile struct {
 	contents string
+	inode    uint64
 }
 
 func (f *staticFile) Attr(ctx context.Context, a *fuse.Attr) error {
 	a.Mode = 0644
+	a.Inode = f.inode
 	a.Size = uint64(len(f.contents))
 	a.Blocks = blocksOf(a.Size)
 	return nil
@@ -714,6 +912,9 @@ var (
 
 	_ fspkg.HandleReadDirAller = (*nodeHandle)(nil)
 	_ fspkg.HandleReader       = (*nodeHandle)(nil)
+
+	_ fspkg.HandleReadDirAller = (*rootNode)(nil)
+	_ fspkg.NodeStringLookuper = (*rootNode)(nil)
 )
 
 func blocksOf(size uint64) (blocks uint64) {
@@ -767,7 +968,7 @@ func (h *nodeHandle) ReadDirAll(ctx context.Context) (ents []fuse.Dirent, err er
 func (n *node) Lookup(ctx context.Context, name string) (fspkg.Node, error) {
 	e, ok := n.te.LookupChild(name)
 	if !ok {
-		return nil, syscall.ENOENT
+		return nil, fuse.ENOENT
 	}
 	return &node{n.fs, e, n.sr, nil}, nil
 }
