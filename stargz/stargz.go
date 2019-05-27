@@ -443,8 +443,8 @@ func (fr *fileReader) ReadAt(p []byte, off int64) (n int, err error) {
 		i = sort.Search(len(fr.ents), func(i int) bool {
 			return fr.ents[i].ChunkOffset >= off
 		})
-		if i == -1 {
-			return 0, errors.New("internal error; error finding chunk given offset")
+		if i == len(fr.ents) {
+			i = len(fr.ents) - 1
 		}
 	}
 	ent := fr.ents[i]
