@@ -129,6 +129,7 @@ func TestWriteAndOpen(t *testing.T) {
 				hasFileContentsRange("foo/big.txt", 10, "ch a big file"),
 				hasFileContentsRange("foo/big.txt", 11, "h a big file"),
 				hasFileContentsRange("foo/big.txt", 12, " a big file"),
+				hasFileContentsRange("foo/big.txt", len("This is such a big file")-1, ""),
 				hasChunkEntries("foo/big.txt", 6),
 			),
 		},
