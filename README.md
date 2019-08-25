@@ -30,7 +30,7 @@ our container images on demand?
 Go's continuous build system tests Go on [many operating systems and
 architectures](https://build.golang.org/), using a mix of containers
 (mostly for Linux) and VMs (for other operating systems). We
-prioritize fast builds, targetting 5 minute turnaround for pre-submit
+prioritize fast builds, targeting 5 minute turnaround for pre-submit
 tests when testing new changes. For isolation and other reasons, we
 run all our containers in a single-use fresh VMs. Generally our
 containers do start quickly, but some of our containers are very large
