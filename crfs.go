@@ -474,6 +474,7 @@ func (n *layerDebugRoot) Lookup(ctx context.Context, name string) (fspkg.Node, e
 		te: root,
 		sr: r,
 		f:  f,
+		children: make(map[string]fspkg.Node),
 	}, nil
 }
 
@@ -775,6 +776,7 @@ func (n *layerHostOwnerImageReference) Lookup(ctx context.Context, name string) 
 		fs: n.fs,
 		te: root,
 		sr: r,
+		children: make(map[string]fspkg.Node),
 	}, nil
 }
 
@@ -901,6 +903,7 @@ type node struct {
 	te *stargz.TOCEntry
 	sr *stargz.Reader
 	f  *os.File // non-nil if root & in debug mode
+	children map[string]fspkg.Node // Remenber child nodes once looked up.
 }
 
 var (
@@ -966,11 +969,19 @@ func (h *nodeHandle) ReadDirAll(ctx context.Context) (ents []fuse.Dirent, err er
 //
 // See https://godoc.org/bazil.org/fuse/fs#NodeStringLookuper
 func (n *node) Lookup(ctx context.Context, name string) (fspkg.Node, error) {
+    	if c, ok := n.children[name] ; ok {
+    		return c, nil
+    	}
+
 	e, ok := n.te.LookupChild(name)
 	if !ok {
 		return nil, fuse.ENOENT
 	}
-	return &node{n.fs, e, n.sr, nil}, nil
+	
+    	c := &node{n.fs, e, n.sr, nil, make(map[string]fspkg.Node)}
+    	n.children[name] = c
+    
+    	return c, nil
 }
 
 // Readlink reads the target of a symlink.
