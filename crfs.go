@@ -1060,6 +1060,10 @@ func (h *nodeHandle) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse
 		if err != nil {
 			return err
 		}
+		if nr == 0 {
+			// Truncate unncessary data
+			chunkData = chunkData[req.Offset:]
+		}
 		n := copy(resp.Data[nr:], chunkData)
 		nr += n
 	}
