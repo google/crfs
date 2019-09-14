@@ -904,6 +904,7 @@ type node struct {
 	sr *stargz.Reader
 	f  *os.File // non-nil if root & in debug mode
 
+	mu sync.Mutex // For children maps.
 	// children maps from previously-looked up base names (like "foo.txt") to
 	// the *node that was previously returned. This prevents FUSE inode numbers
 	// from getting out of sync
@@ -988,8 +989,16 @@ func (n *node) Lookup(ctx context.Context, name string) (fspkg.Node, error) {
 		sr: n.sr,
 		child: make(map[string]*node),
 	}
-    	n.child[name] = c
-    
+	n.mu.Lock()
+	if c2, ok := n.child[name] ; ok {
+		// Someone generated node object during our looking up.
+		// In this case, we use this registered one not to make kernel confused.
+		c = c2
+	} else {
+		n.child[name] = c
+	}
+	n.mu.Unlock()
+	
     	return c, nil
 }
 
