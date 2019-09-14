@@ -367,6 +367,9 @@ func (r *Reader) ChunkEntryForOffset(name string, offset int64) (e *TOCEntry, ok
 	}
 	ents := r.chunks[name]
 	if len(ents) < 2 {
+		if offset >= e.ChunkSize {
+			return nil, false
+		}
 		return e, true
 	}
 	i := sort.Search(len(ents), func(i int) bool {
