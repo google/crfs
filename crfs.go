@@ -974,6 +974,8 @@ func (h *nodeHandle) ReadDirAll(ctx context.Context) (ents []fuse.Dirent, err er
 //
 // See https://godoc.org/bazil.org/fuse/fs#NodeStringLookuper
 func (n *node) Lookup(ctx context.Context, name string) (fspkg.Node, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
     	if c, ok := n.child[name] ; ok {
     		return c, nil
     	}
@@ -989,15 +991,7 @@ func (n *node) Lookup(ctx context.Context, name string) (fspkg.Node, error) {
 		sr: n.sr,
 		child: make(map[string]*node),
 	}
-	n.mu.Lock()
-	if c2, ok := n.child[name] ; ok {
-		// Someone generated node object during our looking up.
-		// In this case, we use this registered one not to make kernel confused.
-		c = c2
-	} else {
-		n.child[name] = c
-	}
-	n.mu.Unlock()
+	n.child[name] = c
 	
     	return c, nil
 }
