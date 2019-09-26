@@ -904,10 +904,10 @@ type node struct {
 	sr *stargz.Reader
 	f  *os.File // non-nil if root & in debug mode
 
-	mu sync.Mutex // For children maps.
-	// children maps from previously-looked up base names (like "foo.txt") to
-	// the *node that was previously returned. This prevents FUSE inode numbers
-	// from getting out of sync
+	mu sync.Mutex // guards child, below
+	// child maps from previously-looked up base names (like "foo.txt") to the *node
+	// that was previously returned. This prevents FUSE inode numbers from getting
+	// out of sync
 	child map[string]*node
 }
 
