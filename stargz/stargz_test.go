@@ -488,3 +488,72 @@ func symlink(name, target string) tarEntry {
 		})
 	})
 }
+
+const (
+	chunkSize int64 = 4
+)
+
+// Tests *Reader.ChunkEntryForOffset about offset and size calculation.
+func TestChunkEntryForOffset(t *testing.T) {
+	tests := []struct {
+		name            string
+		fileSize        int64
+		reqOffset       int64
+		wantOk          bool
+		wantChunkOffset int64
+		wantChunkSize   int64
+	}{
+		{
+			name:            "1st_chunk_in_1_chunk_reg",
+			fileSize:        chunkSize * 1,
+			reqOffset:       chunkSize * 0,
+			wantChunkOffset: chunkSize * 0,
+			wantChunkSize:   chunkSize,
+			wantOk:          true,
+		},
+		{
+			name:      "2nd_chunk_in_1_chunk_reg",
+			fileSize:  chunkSize * 1,
+			reqOffset: chunkSize * 1,
+			wantOk:    false,
+		},
+		{
+			name:            "1st_chunk_in_2_chunks_reg",
+			fileSize:        chunkSize * 2,
+			reqOffset:       chunkSize * 0,
+			wantChunkOffset: chunkSize * 0,
+			wantChunkSize:   chunkSize,
+			wantOk:          true,
+		},
+		{
+			name:            "2nd_chunk_in_2_chunks_reg",
+			fileSize:        chunkSize * 2,
+			reqOffset:       chunkSize * 1,
+			wantChunkOffset: chunkSize * 1,
+			wantChunkSize:   chunkSize,
+			wantOk:          true,
+		},
+		{
+			name:      "3rd_chunk_in_2_chunks_reg",
+			fileSize:  chunkSize * 2,
+			reqOffset: chunkSize * 2,
+			wantOk:    false,
+		},
+	}
+
+	for _, te := range tests {
+		t.Run(te.name, func(t *testing.T) {
+			name := "test"
+			_, r := StubRegularFileReader(name, te.fileSize, chunkSize)
+			ce, ok := r.ChunkEntryForOffset(name, te.reqOffset)
+			if ok != te.wantOk {
+				t.Errorf("ok = %v; want (%v)", ok, te.wantOk)
+			} else if ok {
+				if !(ce.ChunkOffset == te.wantChunkOffset && ce.ChunkSize == te.wantChunkSize) {
+					t.Errorf("chunkOffset = %d, ChunkSize = %d; want (chunkOffset = %d, chunkSize = %d)",
+						ce.ChunkOffset, ce.ChunkSize, te.wantChunkOffset, te.wantChunkSize)
+				}
+			}
+		})
+	}
+}
