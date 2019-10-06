@@ -99,7 +99,9 @@ func Open(sr *io.SectionReader) (*Reader, error) {
 		return nil, fmt.Errorf("error decoding TOC JSON: %v", err)
 	}
 	r := &Reader{sr: sr, toc: toc}
-	r.initFields()
+	if err := r.initFields(); err != nil {
+		return nil, fmt.Errorf("failed to initialize fields of entries: %v", err)
+	}
 	return r, nil
 }
 
@@ -175,6 +177,9 @@ type TOCEntry struct {
 	ChunkSize   int64 `json:"chunkSize,omitempty"`
 
 	children map[string]*TOCEntry
+
+	// Nlink is the number of entry names pointing to this entry.
+	Nlink int
 }
 
 // ModTime returns the entry's modification time.
@@ -253,7 +258,7 @@ func (fi fileInfo) Mode() (m os.FileMode) {
 //
 // Unexported fields are populated and TOCEntry fields that were
 // implicit in the JSON are populated.
-func (r *Reader) initFields() {
+func (r *Reader) initFields() error {
 	r.m = make(map[string]*TOCEntry, len(r.toc.Entries))
 	r.chunks = make(map[string][]*TOCEntry)
 	var lastPath string
@@ -321,6 +326,15 @@ func (r *Reader) initFields() {
 			name = strings.TrimSuffix(name, "/")
 		}
 		pdir := r.getOrCreateDir(parentDir(name))
+		ent.Nlink++ // at least one name(ent.Name) references this entry.
+		if ent.Type == "hardlink" {
+			if org, ok := r.m[ent.LinkName]; ok {
+				org.Nlink++ // original entry is referenced by this ent.Name.
+				ent = org
+			} else {
+				return fmt.Errorf("%s is hardlink but the linkname %s isn't found", ent.Name, ent.LinkName)
+			}
+		}
 		pdir.addChild(path.Base(name), ent)
 	}
 
@@ -334,6 +348,8 @@ func (r *Reader) initFields() {
 			lastOffset = e.Offset
 		}
 	}
+
+	return nil
 }
 
 func parentDir(p string) string {
@@ -390,6 +406,9 @@ func (r *Reader) Lookup(path string) (e *TOCEntry, ok bool) {
 	// here? And it probably needs a link count field stored in
 	// the TOCEntry.
 	e, ok = r.m[path]
+	if ok && e.Type == "hardlink" {
+		e, ok = r.m[e.LinkName]
+	}
 	return
 }
 

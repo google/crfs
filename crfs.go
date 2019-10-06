@@ -946,7 +946,7 @@ func (n *node) Attr(ctx context.Context, a *fuse.Attr) error {
 	a.Uid = uint32(n.te.Uid)
 	a.Gid = uint32(n.te.Gid)
 	a.Rdev = uint32(unix.Mkdev(uint32(n.te.DevMajor), uint32(n.te.DevMinor)))
-	a.Nlink = 1 // TODO: get this from te once hardlinks are more supported
+	a.Nlink = uint32(n.te.Nlink)
 	if debug {
 		log.Printf("attr of %s: %s", n.te.Name, *a)
 	}
