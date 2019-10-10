@@ -23,6 +23,7 @@ import (
 
 	"github.com/google/crfs/stargz"
 	"github.com/google/go-containerregistry/pkg/authn"
+	"github.com/google/go-containerregistry/pkg/logs"
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
@@ -33,8 +34,11 @@ import (
 )
 
 var (
-	upgrade = flag.Bool("upgrade", false, "upgrade the image in-place by overwriting the tag")
-	flatten = flag.Bool("flatten", false, "flatten the image's layers into a single layer")
+	upgrade  = flag.Bool("upgrade", false, "upgrade the image in-place by overwriting the tag")
+	flatten  = flag.Bool("flatten", false, "flatten the image's layers into a single layer")
+	insecAll = flag.Bool("insecure", false, "allow connections to all registries using HTTP")
+	insecSrc = flag.Bool("insecure-src", false, "allow connections to the source registry using HTTP")
+	insecDst = flag.Bool("insecure-dst", false, "allow connections to the destination registry using HTTP")
 
 	usage = `usage: %[1]s [-upgrade] [-flatten] input [output]
 
@@ -61,6 +65,10 @@ func main() {
 	if len(flag.Args()) < 1 {
 		printUsage()
 	}
+
+	// Set up logs package to get useful messages i.e. progress.
+	logs.Warn.SetOutput(os.Stderr)
+	logs.Progress.SetOutput(os.Stderr)
 
 	if strings.HasPrefix(flag.Args()[0], "file:") {
 		// We'll use "file:" prefix as a signal to convert single files.
@@ -159,7 +167,13 @@ func parseFlags(args []string) (string, string) {
 
 func convertImage() {
 	src, dst := parseFlags(flag.Args())
-	srcRef, err := name.ParseReference(src)
+
+	var opts []name.Option
+	if *insecSrc || *insecAll {
+		// fetch the image using HTTP protocol.
+		opts = append(opts, name.Insecure)
+	}
+	srcRef, err := name.ParseReference(src, opts...)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -204,7 +218,12 @@ func convertImage() {
 	}
 
 	// Push the stargzified image to dst.
-	dstRef, err := name.ParseReference(dst)
+	opts = nil
+	if *insecDst || *insecAll {
+		// upload the image using HTTP protocol.
+		opts = append(opts, name.Insecure)
+	}
+	dstRef, err := name.ParseReference(dst, opts...)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -213,7 +232,7 @@ func convertImage() {
 		log.Fatal(err)
 	}
 
-	if err := remote.Write(dstRef, img, dstAuth, http.DefaultTransport); err != nil {
+	if err := remote.Write(dstRef, img, remote.WithAuth(dstAuth), remote.WithTransport(http.DefaultTransport)); err != nil {
 		log.Fatal(err)
 	}
 }
