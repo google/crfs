@@ -23,8 +23,9 @@ import (
 
 	"github.com/google/crfs/stargz"
 	"github.com/google/go-containerregistry/pkg/authn"
+	"github.com/google/go-containerregistry/pkg/logs"
 	"github.com/google/go-containerregistry/pkg/name"
-	"github.com/google/go-containerregistry/pkg/v1"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
@@ -33,8 +34,9 @@ import (
 )
 
 var (
-	upgrade = flag.Bool("upgrade", false, "upgrade the image in-place by overwriting the tag")
-	flatten = flag.Bool("flatten", false, "flatten the image's layers into a single layer")
+	upgrade  = flag.Bool("upgrade", false, "upgrade the image in-place by overwriting the tag")
+	flatten  = flag.Bool("flatten", false, "flatten the image's layers into a single layer")
+	insecure = flag.Bool("insecure", false, "allow HTTP connections to the registry which has the prefix \"http://\"")
 
 	usage = `usage: %[1]s [-upgrade] [-flatten] input [output]
 
@@ -47,6 +49,9 @@ Converting images:
 
   # converts and flattens "ubuntu"
   %[1]s -flatten ubuntu gcr.io/<your-project>/ubuntu:flattened
+
+  # converts "ubuntu" from dockerhub and uploads to your registry using HTTP
+  %[1]s -insecure ubuntu http://registry:5000/<path>/ubuntu:stargz
 
 Converting files:
   %[1]s file:/tmp/input.tar.gz file:output.stargz
@@ -61,6 +66,10 @@ func main() {
 	if len(flag.Args()) < 1 {
 		printUsage()
 	}
+
+	// Set up logs package to get useful messages i.e. progress.
+	logs.Warn.SetOutput(os.Stderr)
+	logs.Progress.SetOutput(os.Stderr)
 
 	if strings.HasPrefix(flag.Args()[0], "file:") {
 		// We'll use "file:" prefix as a signal to convert single files.
@@ -159,7 +168,8 @@ func parseFlags(args []string) (string, string) {
 
 func convertImage() {
 	src, dst := parseFlags(flag.Args())
-	srcRef, err := name.ParseReference(src)
+
+	srcRef, err := parseReference(src)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -204,7 +214,7 @@ func convertImage() {
 	}
 
 	// Push the stargzified image to dst.
-	dstRef, err := name.ParseReference(dst)
+	dstRef, err := parseReference(dst)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -213,7 +223,7 @@ func convertImage() {
 		log.Fatal(err)
 	}
 
-	if err := remote.Write(dstRef, img, dstAuth, http.DefaultTransport); err != nil {
+	if err := remote.Write(dstRef, img, remote.WithAuth(dstAuth), remote.WithTransport(http.DefaultTransport)); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -246,6 +256,20 @@ type layer struct {
 	d      *digester
 	diff   *v1.Hash
 	digest *v1.Hash
+}
+
+// parseReference is like go-containerregistry/pkg/name.ParseReference but additionally
+// supports the reference starting with "http://" to mean insecure.
+func parseReference(ref string) (name.Reference, error) {
+	var opts []name.Option
+	if strings.HasPrefix(ref, "http://") {
+		if !*insecure {
+			return nil, fmt.Errorf("-insecure flag required when connecting using HTTP to %q", ref)
+		}
+		ref = strings.TrimPrefix(ref, "http://")
+		opts = append(opts, name.Insecure)
+	}
+	return name.ParseReference(ref, opts...)
 }
 
 // newLayer converts the given io.ReadCloser to a stargz layer.
