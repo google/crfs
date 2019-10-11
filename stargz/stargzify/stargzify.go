@@ -34,11 +34,10 @@ import (
 )
 
 var (
-	upgrade  = flag.Bool("upgrade", false, "upgrade the image in-place by overwriting the tag")
-	flatten  = flag.Bool("flatten", false, "flatten the image's layers into a single layer")
-	insecAll = flag.Bool("insecure", false, "allow connections to all registries using HTTP")
-	insecSrc = flag.Bool("insecure-src", false, "allow connections to the source registry using HTTP")
-	insecDst = flag.Bool("insecure-dst", false, "allow connections to the destination registry using HTTP")
+	upgrade    = flag.Bool("upgrade", false, "upgrade the image in-place by overwriting the tag")
+	flatten    = flag.Bool("flatten", false, "flatten the image's layers into a single layer")
+	insecure   = flag.Bool("insecure", false, "allow HTTP connections to the registry which has the prefix \"http://\"")
+	httpPrefix = "http://"
 
 	usage = `usage: %[1]s [-upgrade] [-flatten] input [output]
 
@@ -51,6 +50,9 @@ Converting images:
 
   # converts and flattens "ubuntu"
   %[1]s -flatten ubuntu gcr.io/<your-project>/ubuntu:flattened
+
+  # converts "ubuntu" from dockerhub and uploads to your registry using HTTP
+  %[1]s -insecure ubuntu http://registry:5000/<path>/ubuntu:stargz
 
 Converting files:
   %[1]s file:/tmp/input.tar.gz file:output.stargz
@@ -169,9 +171,14 @@ func convertImage() {
 	src, dst := parseFlags(flag.Args())
 
 	var opts []name.Option
-	if *insecSrc || *insecAll {
+	if strings.HasPrefix(src, httpPrefix) {
+		src = strings.TrimPrefix(src, httpPrefix)
+		// if the source path starts with "http://" and
+		// "-insecure" option is specified,
 		// fetch the image using HTTP protocol.
-		opts = append(opts, name.Insecure)
+		if *insecure {
+			opts = append(opts, name.Insecure)
+		}
 	}
 	srcRef, err := name.ParseReference(src, opts...)
 	if err != nil {
@@ -219,9 +226,14 @@ func convertImage() {
 
 	// Push the stargzified image to dst.
 	opts = nil
-	if *insecDst || *insecAll {
-		// upload the image using HTTP protocol.
-		opts = append(opts, name.Insecure)
+	if strings.HasPrefix(dst, httpPrefix) {
+		dst = strings.TrimPrefix(dst, httpPrefix)
+		if *insecure {
+			// if the destination path starts with "http://" and
+			// "-insecure" option is specified,
+			// upload the image using HTTP protocol.
+			opts = append(opts, name.Insecure)
+		}
 	}
 	dstRef, err := name.ParseReference(dst, opts...)
 	if err != nil {
