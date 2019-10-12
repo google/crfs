@@ -34,10 +34,9 @@ import (
 )
 
 var (
-	upgrade    = flag.Bool("upgrade", false, "upgrade the image in-place by overwriting the tag")
-	flatten    = flag.Bool("flatten", false, "flatten the image's layers into a single layer")
-	insecure   = flag.Bool("insecure", false, "allow HTTP connections to the registry which has the prefix \"http://\"")
-	httpPrefix = "http://"
+	upgrade  = flag.Bool("upgrade", false, "upgrade the image in-place by overwriting the tag")
+	flatten  = flag.Bool("flatten", false, "flatten the image's layers into a single layer")
+	insecure = flag.Bool("insecure", false, "allow HTTP connections to the registry which has the prefix \"http://\"")
 
 	usage = `usage: %[1]s [-upgrade] [-flatten] input [output]
 
@@ -170,15 +169,9 @@ func parseFlags(args []string) (string, string) {
 func convertImage() {
 	src, dst := parseFlags(flag.Args())
 
-	var opts []name.Option
-	if strings.HasPrefix(src, httpPrefix) {
-		src = strings.TrimPrefix(src, httpPrefix)
-		// if the source path starts with "http://" and
-		// "-insecure" option is specified,
-		// fetch the image using HTTP protocol.
-		if *insecure {
-			opts = append(opts, name.Insecure)
-		}
+	src, opts, err := applyInsecureOpt(src)
+	if err != nil {
+		log.Fatal(err)
 	}
 	srcRef, err := name.ParseReference(src, opts...)
 	if err != nil {
@@ -225,15 +218,9 @@ func convertImage() {
 	}
 
 	// Push the stargzified image to dst.
-	opts = nil
-	if strings.HasPrefix(dst, httpPrefix) {
-		dst = strings.TrimPrefix(dst, httpPrefix)
-		if *insecure {
-			// if the destination path starts with "http://" and
-			// "-insecure" option is specified,
-			// upload the image using HTTP protocol.
-			opts = append(opts, name.Insecure)
-		}
+	dst, opts, err = applyInsecureOpt(dst)
+	if err != nil {
+		log.Fatal(err)
 	}
 	dstRef, err := name.ParseReference(dst, opts...)
 	if err != nil {
@@ -277,6 +264,21 @@ type layer struct {
 	d      *digester
 	diff   *v1.Hash
 	digest *v1.Hash
+}
+
+func applyInsecureOpt(path string, opts ...name.Option) (string, []name.Option, error) {
+	if strings.HasPrefix(path, "http://") {
+		path = strings.TrimPrefix(path, "http://")
+		// if the path starts with "http://" and the "-insecure" option is specified,
+		// connect to the registry using HTTP protocol.
+		if *insecure {
+			opts = append(opts, name.Insecure)
+		} else {
+			return "", nil, fmt.Errorf("\"-insecure\" option must be specified to connect to \"%s\" using HTTP", path)
+		}
+	}
+
+	return path, opts, nil
 }
 
 // newLayer converts the given io.ReadCloser to a stargz layer.
