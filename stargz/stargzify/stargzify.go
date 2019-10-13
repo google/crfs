@@ -290,7 +290,7 @@ func (l *layer) Compressed() (io.ReadCloser, error) {
 
 	// Convert input blob to stargz while computing diffid, digest, and size.
 	go func() {
-		w := stargz.NewWriter(pw)
+		w := stargz.NewWriter(io.MultiWriter(pw, l.d))
 		if err := w.AppendTar(l.rc); err != nil {
 			pw.CloseWithError(err)
 			return
@@ -312,7 +312,7 @@ func (l *layer) Compressed() (io.ReadCloser, error) {
 		pw.Close()
 	}()
 
-	return ioutil.NopCloser(io.TeeReader(pr, l.d)), nil
+	return ioutil.NopCloser(pr), nil
 }
 
 func (l *layer) Uncompressed() (io.ReadCloser, error) {
