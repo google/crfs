@@ -164,6 +164,10 @@ type TOCEntry struct {
 	// DevMinor is the major device number for "char" and "block" types.
 	DevMinor int `json:"devMinor,omitempty"`
 
+	// NumLink is the number of entry names pointing to this entry.
+	// Zero means one name references this entry.
+	NumLink int
+
 	// ChunkOffset is non-zero if this is a chunk of a large,
 	// regular file. If so, the Offset is where the gzip header of
 	// ChunkSize bytes at ChunkOffset in Name begin.
@@ -177,9 +181,6 @@ type TOCEntry struct {
 	ChunkSize   int64 `json:"chunkSize,omitempty"`
 
 	children map[string]*TOCEntry
-
-	// Nlink is the number of entry names pointing to this entry.
-	Nlink int
 }
 
 // ModTime returns the entry's modification time.
@@ -326,13 +327,12 @@ func (r *Reader) initFields() error {
 			name = strings.TrimSuffix(name, "/")
 		}
 		pdir := r.getOrCreateDir(parentDir(name))
-		ent.Nlink++ // at least one name(ent.Name) references this entry.
 		if ent.Type == "hardlink" {
 			if org, ok := r.m[ent.LinkName]; ok {
-				org.Nlink++ // original entry is referenced by this ent.Name.
+				org.NumLink++ // original entry is referenced by this ent.Name.
 				ent = org
 			} else {
-				return fmt.Errorf("%s is hardlink but the linkname %s isn't found", ent.Name, ent.LinkName)
+				return fmt.Errorf("%q is a hardlink but the linkname %q isn't found", ent.Name, ent.LinkName)
 			}
 		}
 		pdir.addChild(path.Base(name), ent)
@@ -402,9 +402,6 @@ func (r *Reader) Lookup(path string) (e *TOCEntry, ok bool) {
 	if r == nil {
 		return
 	}
-	// TODO: decide at which stage to handle hard links. Probably
-	// here? And it probably needs a link count field stored in
-	// the TOCEntry.
 	e, ok = r.m[path]
 	if ok && e.Type == "hardlink" {
 		e, ok = r.m[e.LinkName]
