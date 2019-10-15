@@ -489,12 +489,9 @@ func symlink(name, target string) tarEntry {
 	})
 }
 
-const (
-	chunkSize int64 = 4
-)
-
 // Tests *Reader.ChunkEntryForOffset about offset and size calculation.
 func TestChunkEntryForOffset(t *testing.T) {
+	const chunkSize = 4
 	tests := []struct {
 		name            string
 		fileSize        int64
@@ -544,7 +541,7 @@ func TestChunkEntryForOffset(t *testing.T) {
 	for _, te := range tests {
 		t.Run(te.name, func(t *testing.T) {
 			name := "test"
-			_, r := StubRegularFileReader(name, te.fileSize, chunkSize)
+			_, r := regularFileReader(name, te.fileSize, chunkSize)
 			ce, ok := r.ChunkEntryForOffset(name, te.reqOffset)
 			if ok != te.wantOk {
 				t.Errorf("ok = %v; want (%v)", ok, te.wantOk)
@@ -555,5 +552,39 @@ func TestChunkEntryForOffset(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// regularFileReader makes a minimal Reader of "reg" and "chunk" without tar-related information.
+func regularFileReader(name string, size int64, chunkSize int64) (*TOCEntry, *Reader) {
+	ent := &TOCEntry{
+		Name: name,
+		Type: "reg",
+	}
+	m := ent
+	chunks := make([]*TOCEntry, 0, size/chunkSize+1)
+	var written int64
+	for written < size {
+		remain := size - written
+		cs := chunkSize
+		if remain < cs {
+			cs = remain
+		}
+		ent.ChunkSize = cs
+		ent.ChunkOffset = written
+		chunks = append(chunks, ent)
+		written += cs
+		ent = &TOCEntry{
+			Name: name,
+			Type: "chunk",
+		}
+	}
+
+	if len(chunks) == 1 {
+		chunks = nil
+	}
+	return m, &Reader{
+		m:      map[string]*TOCEntry{name: m},
+		chunks: map[string][]*TOCEntry{name: chunks},
 	}
 }
