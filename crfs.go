@@ -1049,10 +1049,14 @@ func (h *nodeHandle) chunkData(offset int64, size int) ([]byte, error) {
 	}
 	h.mu.Unlock()
 
-	log.Printf("reading chunk for offset=%d, size=%d", offset, size)
+	if debug {
+		log.Printf("reading chunk for offset=%d, size=%d", offset, size)
+	}
 	buf := make([]byte, size)
 	n, err := h.sr.ReadAt(buf, offset)
-	log.Printf("... ReadAt = %v, %v", n, err)
+	if debug {
+		log.Printf("... ReadAt = %v, %v", n, err)
+	}
 	if err == nil {
 		h.mu.Lock()
 		h.lastChunkOff = offset
