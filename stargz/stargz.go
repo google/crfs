@@ -99,7 +99,9 @@ func Open(sr *io.SectionReader) (*Reader, error) {
 		return nil, fmt.Errorf("error decoding TOC JSON: %v", err)
 	}
 	r := &Reader{sr: sr, toc: toc}
-	r.initFields()
+	if err := r.initFields(); err != nil {
+		return nil, fmt.Errorf("failed to initialize fields of entries: %v", err)
+	}
 	return r, nil
 }
 
@@ -161,6 +163,10 @@ type TOCEntry struct {
 
 	// DevMinor is the major device number for "char" and "block" types.
 	DevMinor int `json:"devMinor,omitempty"`
+
+	// NumLink is the number of entry names pointing to this entry.
+	// Zero means one name references this entry.
+	NumLink int
 
 	// ChunkOffset is non-zero if this is a chunk of a large,
 	// regular file. If so, the Offset is where the gzip header of
@@ -253,7 +259,7 @@ func (fi fileInfo) Mode() (m os.FileMode) {
 //
 // Unexported fields are populated and TOCEntry fields that were
 // implicit in the JSON are populated.
-func (r *Reader) initFields() {
+func (r *Reader) initFields() error {
 	r.m = make(map[string]*TOCEntry, len(r.toc.Entries))
 	r.chunks = make(map[string][]*TOCEntry)
 	var lastPath string
@@ -321,6 +327,15 @@ func (r *Reader) initFields() {
 			name = strings.TrimSuffix(name, "/")
 		}
 		pdir := r.getOrCreateDir(parentDir(name))
+		ent.NumLink++ // at least one name(ent.Name) references this entry.
+		if ent.Type == "hardlink" {
+			if org, ok := r.m[ent.LinkName]; ok {
+				org.NumLink++ // original entry is referenced by this ent.Name.
+				ent = org
+			} else {
+				return fmt.Errorf("%q is a hardlink but the linkname %q isn't found", ent.Name, ent.LinkName)
+			}
+		}
 		pdir.addChild(path.Base(name), ent)
 	}
 
@@ -334,6 +349,8 @@ func (r *Reader) initFields() {
 			lastOffset = e.Offset
 		}
 	}
+
+	return nil
 }
 
 func parentDir(p string) string {
@@ -386,10 +403,10 @@ func (r *Reader) Lookup(path string) (e *TOCEntry, ok bool) {
 	if r == nil {
 		return
 	}
-	// TODO: decide at which stage to handle hard links. Probably
-	// here? And it probably needs a link count field stored in
-	// the TOCEntry.
 	e, ok = r.m[path]
+	if ok && e.Type == "hardlink" {
+		e, ok = r.m[e.LinkName]
+	}
 	return
 }
 

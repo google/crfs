@@ -161,9 +161,9 @@ func TestWriteAndOpen(t *testing.T) {
 			),
 			wantNumGz: 3,
 			want: checks(
-				lookupMatch("b", &TOCEntry{Name: "b", Type: "block", DevMajor: 123, DevMinor: 456}),
-				lookupMatch("c", &TOCEntry{Name: "c", Type: "char", DevMajor: 111, DevMinor: 222}),
-				lookupMatch("f", &TOCEntry{Name: "f", Type: "fifo"}),
+				lookupMatch("b", &TOCEntry{Name: "b", Type: "block", DevMajor: 123, DevMinor: 456, NumLink: 1}),
+				lookupMatch("c", &TOCEntry{Name: "c", Type: "char", DevMajor: 111, DevMinor: 222, NumLink: 1}),
+				lookupMatch("f", &TOCEntry{Name: "f", Type: "fifo", NumLink: 1}),
 			),
 		},
 	}
