@@ -327,6 +327,7 @@ func (r *Reader) initFields() error {
 			name = strings.TrimSuffix(name, "/")
 		}
 		pdir := r.getOrCreateDir(parentDir(name))
+		ent.NumLink++ // at least one name(ent.Name) references this entry.
 		if ent.Type == "hardlink" {
 			if org, ok := r.m[ent.LinkName]; ok {
 				org.NumLink++ // original entry is referenced by this ent.Name.

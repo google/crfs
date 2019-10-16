@@ -946,7 +946,10 @@ func (n *node) Attr(ctx context.Context, a *fuse.Attr) error {
 	a.Uid = uint32(n.te.Uid)
 	a.Gid = uint32(n.te.Gid)
 	a.Rdev = uint32(unix.Mkdev(uint32(n.te.DevMajor), uint32(n.te.DevMinor)))
-	a.Nlink = uint32(n.te.NumLink + 1)
+	a.Nlink = uint32(n.te.NumLink)
+	if a.Nlink == 0 {
+		a.Nlink = 1 // zero "NumLink" means one so we map them here.
+	}
 	if debug {
 		log.Printf("attr of %s: %s", n.te.Name, *a)
 	}
