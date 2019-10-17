@@ -1060,20 +1060,7 @@ func (h *nodeHandle) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse
 		if err != nil {
 			return err
 		}
-		if ce.ChunkOffset < req.Offset && req.Offset < ce.ChunkOffset+ce.ChunkSize {
-			
-			// Data between req.Offset and ce.ChunkOffset is not required, so we truncate it
-			// If we've already read first nr bytes we also don't need to read it again. It
-			// is possible to occur if we failed to copy full chunkData into resp.Data in a
-			// last loop and we are reading same chunk again.
-			off := req.Offset - ce.ChunkOffset + int64(nr)
-			size := int64(len(chunkData))
-			if off > size {
-				off = size
-			}
-			chunkData = chunkData[off:]
-		}
-		n := copy(resp.Data[nr:], chunkData)
+		n := copy(resp.Data[nr:], chunkData[offset+int64(nr)-ce.ChunkOffset:])
 		nr += n
 	}
 	resp.Data = resp.Data[:nr]
