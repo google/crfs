@@ -1090,7 +1090,7 @@ func (h *nodeHandle) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse
 		if err != nil {
 			return err
 		}
-		n := copy(resp.Data[nr:], chunkData)
+		n := copy(resp.Data[nr:], chunkData[offset+int64(nr)-ce.ChunkOffset:])
 		nr += n
 	}
 	resp.Data = resp.Data[:nr]
