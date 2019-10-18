@@ -711,7 +711,7 @@ func (w *Writer) AppendTar(r io.Reader) error {
 			return fmt.Errorf("unsupported input tar entry %q", h.Typeflag)
 		}
 
-		if h.Typeflag == tar.TypeReg {
+		if h.Typeflag == tar.TypeReg && ent.Size > 0 {
 			var written int64
 			totalSize := ent.Size // save it before we destroy ent
 			for written < totalSize {
