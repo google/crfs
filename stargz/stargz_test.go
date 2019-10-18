@@ -56,6 +56,20 @@ func TestWriteAndOpen(t *testing.T) {
 			),
 		},
 		{
+			name: "1dir_1empty_file",
+			in: tarOf(
+				dir("foo/"),
+				file("foo/bar.txt", ""),
+			),
+			wantNumGz: 3, // dir, TOC, footer
+			want: checks(
+				numTOCEntries(2),
+				hasDir("foo/"),
+				hasFileLen("foo/bar.txt", 0),
+				entryHasChildren("foo", "bar.txt"),
+			),
+		},
+		{
 			name: "1dir_1file",
 			in: tarOf(
 				dir("foo/"),
