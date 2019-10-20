@@ -671,6 +671,12 @@ func (w *Writer) AppendTar(r io.Reader) error {
 		if err != nil {
 			return fmt.Errorf("error reading from source tar: tar.Reader.Next: %v", err)
 		}
+		if h.Name == TOCTarName {
+			// It is possible for a layer to be "stargzified" twice during the
+			// distribution lifecycle. So we reserve "TOCTarName" here to avoid
+			// duplicated entries in the resulting layer.
+			continue
+		}
 		ent := &TOCEntry{
 			Name:        h.Name,
 			Mode:        h.Mode,
