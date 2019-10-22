@@ -223,7 +223,7 @@ func convertImage() {
 		log.Fatal(err)
 	}
 
-	if err := remote.Write(dstRef, img, remote.WithAuth(dstAuth), remote.WithTransport(http.DefaultTransport)); err != nil {
+	if err := remote.Write(dstRef, img, dstAuth, http.DefaultTransport); err != nil {
 		log.Fatal(err)
 	}
 }
