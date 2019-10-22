@@ -168,6 +168,9 @@ type TOCEntry struct {
 	// Zero means one name references this entry.
 	NumLink int
 
+	// Xattrs are the extended attribute for the entry.
+	Xattrs map[string][]byte `json:"xattrs,omitempty"`
+
 	// ChunkOffset is non-zero if this is a chunk of a large,
 	// regular file. If so, the Offset is where the gzip header of
 	// ChunkSize bytes at ChunkOffset in Name begin.
@@ -677,6 +680,14 @@ func (w *Writer) AppendTar(r io.Reader) error {
 			// duplicated entries in the resulting layer.
 			continue
 		}
+
+		var xattrs map[string][]byte
+		if h.Xattrs != nil {
+			xattrs = make(map[string][]byte)
+			for k, v := range h.Xattrs {
+				xattrs[k] = []byte(v)
+			}
+		}
 		ent := &TOCEntry{
 			Name:        h.Name,
 			Mode:        h.Mode,
@@ -685,6 +696,7 @@ func (w *Writer) AppendTar(r io.Reader) error {
 			Uname:       w.nameIfChanged(&w.lastUsername, h.Uid, h.Uname),
 			Gname:       w.nameIfChanged(&w.lastGroupname, h.Gid, h.Gname),
 			ModTime3339: formatModtime(h.ModTime),
+			Xattrs:      xattrs,
 		}
 		w.condOpenGz()
 		tw := tar.NewWriter(currentGzipWriter{w})
