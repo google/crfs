@@ -1,0 +1,14 @@
+Starting a container should be fast. Currently, however, starting a
+container in many environments requires doing a `pull` operation from
+a container registry to read the entire container image from the
+registry and write the entire container image to the local machine's
+disk. It's pretty silly (and wasteful) that a read operation becomes a
+write operation. For small containers, this problem is rarely noticed.
+For larger containers, though, the pull operation quickly becomes the
+slowest part of launching a container, especially on a cold node.
+Contrast this with launching a VM on major cloud providers: even with
+a VM image that's hundreds of gigabytes, the VM boots in seconds.
+That's because the hypervisors' block devices are reading from the
+network on demand. The cloud providers all have great internal
+networks. Why aren't we using those great internal networks to read
+our container images on demand?
