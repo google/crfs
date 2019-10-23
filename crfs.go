@@ -1009,6 +1009,37 @@ func (n *node) Readlink(ctx context.Context, req *fuse.ReadlinkRequest) (string,
 	return n.te.LinkName, nil
 }
 
+// Listxattr lists the extended attributes specified for the node.
+//
+// See https://godoc.org/bazil.org/fuse/fs#NodeListxattrer
+func (n *node) Listxattr(ctx context.Context, req *fuse.ListxattrRequest, resp *fuse.ListxattrResponse) error {
+	var allXattrs []byte
+	for k, _ := range n.te.Xattrs {
+		allXattrs = append(append(allXattrs, []byte(k)...), 0)
+	}
+
+	if req.Position >= uint32(len(allXattrs)) {
+		resp.Xattr = []byte{}
+		return nil
+	}
+	resp.Xattr = allXattrs[req.Position:]
+	return nil
+}
+
+// Getxattr reads the specified extended attribute.
+//
+// See https://godoc.org/bazil.org/fuse/fs#NodeGetxattrer
+func (n *node) Getxattr(ctx context.Context, req *fuse.GetxattrRequest, resp *fuse.GetxattrResponse) error {
+
+	xattr := n.te.Xattrs[req.Name]
+	if req.Position >= uint32(len(xattr)) {
+		resp.Xattr = []byte{}
+		return nil
+	}
+	resp.Xattr = xattr[req.Position:]
+	return nil
+}
+
 func (n *node) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (fspkg.Handle, error) {
 	h := &nodeHandle{
 		n:     n,

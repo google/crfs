@@ -40,6 +40,10 @@ func TestFooter(t *testing.T) {
 
 func TestWriteAndOpen(t *testing.T) {
 	const content = "Some contents"
+	invalidUtf8 := "\xff\xfe\xfd"
+
+	xAttrFile := xAttr{"foo": "bar", "invalid-utf8": invalidUtf8}
+
 	tests := []struct {
 		name      string
 		chunkSize int
@@ -73,7 +77,7 @@ func TestWriteAndOpen(t *testing.T) {
 			name: "1dir_1file",
 			in: tarOf(
 				dir("foo/"),
-				file("foo/bar.txt", content),
+				file("foo/bar.txt", content, xAttrFile),
 			),
 			wantNumGz: 4, // var dir, foo.txt alone, TOC, footer
 			want: checks(
@@ -84,6 +88,8 @@ func TestWriteAndOpen(t *testing.T) {
 				hasFileContentsRange("foo/bar.txt", 1, content[1:]),
 				entryHasChildren("", "foo"),
 				entryHasChildren("foo", "bar.txt"),
+				hasFileXattrs("foo/bar.txt", "foo", "bar"),
+				hasFileXattrs("foo/bar.txt", "invalid-utf8", invalidUtf8),
 			),
 		},
 		{
@@ -306,6 +312,33 @@ func hasFileLen(file string, wantLen int) stargzCheck {
 	})
 }
 
+func hasFileXattrs(file, name, value string) stargzCheck {
+	return stargzCheckFn(func(t *testing.T, r *Reader) {
+		for _, ent := range r.toc.Entries {
+			if ent.Name == file {
+				if ent.Type != "reg" {
+					t.Errorf("file type of %q is %q; want \"reg\"", file, ent.Type)
+				}
+				if ent.Xattrs == nil {
+					t.Errorf("file %q has no xattrs", file)
+					return
+				}
+				valueFound, found := ent.Xattrs[name]
+				if !found {
+					t.Errorf("file %q has no xattr %q", file, name)
+					return
+				}
+				if string(valueFound) != value {
+					t.Errorf("file %q has xattr %q with value %q instead of %q", file, name, valueFound, value)
+				}
+
+				return
+			}
+		}
+		t.Errorf("file %q not found", file)
+	})
+}
+
 func hasFileContentsRange(file string, offset int, want string) stargzCheck {
 	return stargzCheckFn(func(t *testing.T, r *Reader) {
 		f, err := r.OpenFile(file)
@@ -471,10 +504,18 @@ func dir(d string) tarEntry {
 	})
 }
 
-func file(name, contents string, extraAttr ...interface{}) tarEntry {
+// xAttr are extended attributes to set on test files created with the file func.
+type xAttr map[string]string
+
+func file(name, contents string, opts ...interface{}) tarEntry {
 	return tarEntryFunc(func(tw *tar.Writer) error {
-		if len(extraAttr) > 0 {
-			return errors.New("unsupported extraAttr")
+		var xattrs xAttr
+		for _, opt := range opts {
+			if v, ok := opt.(xAttr); ok {
+				xattrs = v
+			} else {
+				return errors.New("unsupported opt")
+			}
 		}
 		if strings.HasSuffix(name, "/") {
 			return fmt.Errorf("bogus trailing slash in file %q", name)
@@ -483,6 +524,7 @@ func file(name, contents string, extraAttr ...interface{}) tarEntry {
 			Typeflag: tar.TypeReg,
 			Name:     name,
 			Mode:     0644,
+			Xattrs:   xattrs,
 			Size:     int64(len(contents)),
 		}); err != nil {
 			return err
