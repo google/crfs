@@ -1,0 +1,14 @@
+import java.util.Scanner;
+public class User_Name
+{
+	public static void main(String []args)
+	{
+		Scanner sc = new Scanner(System.in);
+		System.out.println("Enter the User name");
+		String s = sc.nextLine();
+		String old = "“Hello <<UserName>>, How are you?”";
+		old = old.replaceAll("<<UserName>>", s);
+		System.out.println("Given string after replacing the <<USERNAME>> : ");
+		System.out.println("    "+old);
+	}
+}
