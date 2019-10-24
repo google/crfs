@@ -1,0 +1,8 @@
+list1=[5,20,8,15,30]
+Empty_list=[]
+n=len(list1)
+for i in n:
+    m=max(list1)
+    list1.remove(m)
+    Empty_list.append(m)
+print(Empty_list)
