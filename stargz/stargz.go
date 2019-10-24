@@ -268,9 +268,15 @@ func (r *Reader) initFields() error {
 	var lastPath string
 	uname := map[int]string{}
 	gname := map[int]string{}
+	dirs := make(map[string]*TOCEntry)
 	var lastRegEnt *TOCEntry
 	for _, ent := range r.toc.Entries {
 		ent.Name = strings.TrimPrefix(ent.Name, "./")
+		if ent.Type == "dir" {
+			name := strings.TrimSuffix(ent.Name, "/")
+			dirs[name] = ent
+			continue
+		}
 		if ent.Type == "reg" {
 			lastRegEnt = ent
 		}
@@ -329,7 +335,7 @@ func (r *Reader) initFields() error {
 		if ent.Type == "dir" {
 			name = strings.TrimSuffix(name, "/")
 		}
-		pdir := r.getOrCreateDir(parentDir(name))
+		pdir := r.getOrCreateDir(parentDir(name), dirs)
 		ent.NumLink++ // at least one name(ent.Name) references this entry.
 		if ent.Type == "hardlink" {
 			if org, ok := r.m[ent.LinkName]; ok {
@@ -361,17 +367,20 @@ func parentDir(p string) string {
 	return strings.TrimSuffix(dir, "/")
 }
 
-func (r *Reader) getOrCreateDir(d string) *TOCEntry {
+func (r *Reader) getOrCreateDir(d string, dirs map[string]*TOCEntry) *TOCEntry {
 	e, ok := r.m[d]
 	if !ok {
-		e = &TOCEntry{
-			Name: d,
-			Type: "dir",
-			Mode: 0755,
+		e, ok = dirs[d] // expects the directory is in the TOC to preserve the matadata.
+		if !ok {        // if not, fallbacks to the default TOCEntry.
+			e = &TOCEntry{
+				Name: d,
+				Type: "dir",
+				Mode: 0755,
+			}
 		}
 		r.m[d] = e
 		if d != "" {
-			pdir := r.getOrCreateDir(parentDir(d))
+			pdir := r.getOrCreateDir(parentDir(d), dirs)
 			pdir.addChild(path.Base(d), e)
 		}
 	}
