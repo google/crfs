@@ -370,7 +370,7 @@ func parentDir(p string) string {
 func (r *Reader) getOrCreateDir(d string, dirs map[string]*TOCEntry) *TOCEntry {
 	e, ok := r.m[d]
 	if !ok {
-		e, ok = dirs[d] // expects the directory is in the TOC to preserve the matadata.
+		e, ok = dirs[d] // expects the directory is in the TOC to preserve the metadata.
 		if !ok {        // if not, fallbacks to the default TOCEntry.
 			e = &TOCEntry{
 				Name: d,
