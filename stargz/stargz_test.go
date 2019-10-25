@@ -71,6 +71,7 @@ func TestWriteAndOpen(t *testing.T) {
 				hasDir("foo/"),
 				hasFileLen("foo/bar.txt", 0),
 				entryHasChildren("foo", "bar.txt"),
+				hasFileDigest("foo/bar.txt", digestFor("")),
 			),
 		},
 		{
@@ -84,6 +85,7 @@ func TestWriteAndOpen(t *testing.T) {
 				numTOCEntries(2),
 				hasDir("foo/"),
 				hasFileLen("foo/bar.txt", len(content)),
+				hasFileDigest("foo/bar.txt", digestFor(content)),
 				hasFileContentsRange("foo/bar.txt", 0, content),
 				hasFileContentsRange("foo/bar.txt", 1, content[1:]),
 				entryHasChildren("", "foo"),
@@ -136,6 +138,7 @@ func TestWriteAndOpen(t *testing.T) {
 				numTOCEntries(7), // 1 for foo dir, 6 for the foo/big.txt file
 				hasDir("foo/"),
 				hasFileLen("foo/big.txt", len("This is such a big file")),
+				hasFileDigest("foo/big.txt", digestFor("This is such a big file")),
 				hasFileContentsRange("foo/big.txt", 0, "This is such a big file"),
 				hasFileContentsRange("foo/big.txt", 1, "his is such a big file"),
 				hasFileContentsRange("foo/big.txt", 2, "is is such a big file"),
@@ -265,6 +268,11 @@ func countGzStreams(t *testing.T, b []byte) (numStreams int) {
 	}
 }
 
+func digestFor(content string) string {
+	sum := sha256.Sum256([]byte(content))
+	return fmt.Sprintf("sha256:%x", sum)
+}
+
 type numTOCEntries int
 
 func (n numTOCEntries) check(t *testing.T, r *Reader) {
@@ -336,6 +344,18 @@ func hasFileXattrs(file, name, value string) stargzCheck {
 			}
 		}
 		t.Errorf("file %q not found", file)
+	})
+}
+
+func hasFileDigest(file string, digest string) stargzCheck {
+	return stargzCheckFn(func(t *testing.T, r *Reader) {
+		ent, ok := r.Lookup(file)
+		if !ok {
+			t.Fatalf("didn't find TOCEntry for file %q", file)
+		}
+		if ent.Digest != digest {
+			t.Fatalf("Digest(%q) = %q, want %q", file, ent.Digest, digest)
+		}
 	})
 }
 
