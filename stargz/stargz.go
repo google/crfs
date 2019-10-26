@@ -197,6 +197,9 @@ func (e *TOCEntry) addChild(baseName string, child *TOCEntry) {
 	if e.children == nil {
 		e.children = make(map[string]*TOCEntry)
 	}
+	if child.Type == "dir" {
+		e.NumLink++ // Entry ".." in the subdirectory links to this directory
+	}
 	e.children[baseName] = child
 }
 
@@ -296,7 +299,13 @@ func (r *Reader) initFields() error {
 
 			ent.modTime, _ = time.Parse(time.RFC3339, ent.ModTime3339)
 
-			r.m[ent.Name] = ent
+			if ent.Type == "dir" {
+				ent.NumLink++ // Parent dir links to this directory
+				r.m[strings.TrimSuffix(ent.Name, "/")] = ent
+
+			} else {
+				r.m[ent.Name] = ent
+			}
 		}
 		if ent.Type == "reg" && ent.ChunkSize > 0 && ent.ChunkSize < ent.Size {
 			r.chunks[ent.Name] = make([]*TOCEntry, 0, ent.Size/ent.ChunkSize+1)
@@ -365,9 +374,10 @@ func (r *Reader) getOrCreateDir(d string) *TOCEntry {
 	e, ok := r.m[d]
 	if !ok {
 		e = &TOCEntry{
-			Name: d,
-			Type: "dir",
-			Mode: 0755,
+			Name:    d,
+			Type:    "dir",
+			Mode:    0755,
+			NumLink: 2, // The directory itself(.) and the parent link to this directory.
 		}
 		r.m[d] = e
 		if d != "" {
