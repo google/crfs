@@ -296,7 +296,11 @@ func (r *Reader) initFields() error {
 
 			ent.modTime, _ = time.Parse(time.RFC3339, ent.ModTime3339)
 
-			r.m[ent.Name] = ent
+			if ent.Type == "dir" {
+				r.m[strings.TrimSuffix(ent.Name, "/")] = ent
+			} else {
+				r.m[ent.Name] = ent
+			}
 		}
 		if ent.Type == "reg" && ent.ChunkSize > 0 && ent.ChunkSize < ent.Size {
 			r.chunks[ent.Name] = make([]*TOCEntry, 0, ent.Size/ent.ChunkSize+1)
