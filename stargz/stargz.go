@@ -302,7 +302,6 @@ func (r *Reader) initFields() error {
 			if ent.Type == "dir" {
 				ent.NumLink++ // Parent dir links to this directory
 				r.m[strings.TrimSuffix(ent.Name, "/")] = ent
-
 			} else {
 				r.m[ent.Name] = ent
 			}

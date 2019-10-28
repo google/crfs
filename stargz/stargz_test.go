@@ -43,6 +43,7 @@ func TestWriteAndOpen(t *testing.T) {
 	invalidUtf8 := "\xff\xfe\xfd"
 
 	xAttrFile := xAttr{"foo": "bar", "invalid-utf8": invalidUtf8}
+	sampleOwner := owner{uid: 50, gid: 100}
 
 	tests := []struct {
 		name      string
@@ -95,9 +96,9 @@ func TestWriteAndOpen(t *testing.T) {
 		{
 			name: "2meta_2file",
 			in: tarOf(
-				dir("bar/"),
-				dir("foo/"),
-				file("foo/bar.txt", content),
+				dir("bar/", sampleOwner),
+				dir("foo/", sampleOwner),
+				file("foo/bar.txt", content, sampleOwner),
 			),
 			wantNumGz: 4, // both dirs, foo.txt alone, TOC, footer
 			want: checks(
@@ -108,6 +109,9 @@ func TestWriteAndOpen(t *testing.T) {
 				entryHasChildren("", "bar", "foo"),
 				entryHasChildren("foo", "bar.txt"),
 				hasChunkEntries("foo/bar.txt", 1),
+				hasEntryOwner("bar/", sampleOwner),
+				hasEntryOwner("foo/", sampleOwner),
+				hasEntryOwner("foo/bar.txt", sampleOwner),
 			),
 		},
 		{
@@ -494,6 +498,20 @@ func lookupMatch(name string, want *TOCEntry) stargzCheck {
 	})
 }
 
+func hasEntryOwner(entry string, owner owner) stargzCheck {
+	return stargzCheckFn(func(t *testing.T, r *Reader) {
+		ent, ok := r.Lookup(strings.TrimSuffix(entry, "/"))
+		if !ok {
+			t.Errorf("entry %q not found", entry)
+			return
+		}
+		if ent.Uid != owner.uid || ent.Gid != owner.gid {
+			t.Errorf("entry %q has invalid owner (uid:%d, gid:%d) instead of (uid:%d, gid:%d)", entry, ent.Uid, ent.Gid, owner.uid, owner.gid)
+			return
+		}
+	})
+}
+
 type tarEntry interface {
 	appendTar(*tar.Writer) error
 }
@@ -522,8 +540,16 @@ func buildTarGz(t *testing.T, ents []tarEntry) (r io.Reader, cancel func()) {
 	return pr, func() { go pr.Close(); go pw.Close() }
 }
 
-func dir(d string) tarEntry {
+func dir(d string, opts ...interface{}) tarEntry {
 	return tarEntryFunc(func(tw *tar.Writer) error {
+		var o owner
+		for _, opt := range opts {
+			if v, ok := opt.(owner); ok {
+				o = v
+			} else {
+				return errors.New("unsupported opt")
+			}
+		}
 		name := string(d)
 		if !strings.HasSuffix(name, "/") {
 			panic(fmt.Sprintf("missing trailing slash in dir %q ", name))
@@ -532,6 +558,8 @@ func dir(d string) tarEntry {
 			Typeflag: tar.TypeDir,
 			Name:     name,
 			Mode:     0755,
+			Uid:      o.uid,
+			Gid:      o.gid,
 		})
 	})
 }
@@ -539,13 +567,23 @@ func dir(d string) tarEntry {
 // xAttr are extended attributes to set on test files created with the file func.
 type xAttr map[string]string
 
+// owner is owner ot set on test files and directories with the file and dir functions.
+type owner struct {
+	uid int
+	gid int
+}
+
 func file(name, contents string, opts ...interface{}) tarEntry {
 	return tarEntryFunc(func(tw *tar.Writer) error {
 		var xattrs xAttr
+		var o owner
 		for _, opt := range opts {
-			if v, ok := opt.(xAttr); ok {
+			switch v := opt.(type) {
+			case xAttr:
 				xattrs = v
-			} else {
+			case owner:
+				o = v
+			default:
 				return errors.New("unsupported opt")
 			}
 		}
@@ -558,6 +596,8 @@ func file(name, contents string, opts ...interface{}) tarEntry {
 			Mode:     0644,
 			Xattrs:   xattrs,
 			Size:     int64(len(contents)),
+			Uid:      o.uid,
+			Gid:      o.gid,
 		}); err != nil {
 			return err
 		}
