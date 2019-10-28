@@ -115,6 +115,20 @@ func TestWriteAndOpen(t *testing.T) {
 			),
 		},
 		{
+			name: "3dir",
+			in: tarOf(
+				dir("bar/"),
+				dir("foo/"),
+				dir("foo/bar/"),
+			),
+			wantNumGz: 3, // 3 dirs, TOC, footer
+			want: checks(
+				hasDirLinkCount("bar/", 2),
+				hasDirLinkCount("foo/", 3),
+				hasDirLinkCount("foo/bar/", 2),
+			),
+		},
+		{
 			name: "symlink",
 			in: tarOf(
 				dir("foo/"),
@@ -429,6 +443,24 @@ func hasDir(file string) stargzCheck {
 			if ent.Name == file {
 				if ent.Type != "dir" {
 					t.Errorf("file type of %q is %q; want \"dir\"", file, ent.Type)
+				}
+				return
+			}
+		}
+		t.Errorf("directory %q not found", file)
+	})
+}
+
+func hasDirLinkCount(file string, count int) stargzCheck {
+	return stargzCheckFn(func(t *testing.T, r *Reader) {
+		for _, ent := range r.toc.Entries {
+			if ent.Name == file {
+				if ent.Type != "dir" {
+					t.Errorf("file type of %q is %q; want \"dir\"", file, ent.Type)
+					return
+				}
+				if ent.NumLink != count {
+					t.Errorf("link count of %q = %d; want %d", file, ent.NumLink, count)
 				}
 				return
 			}
