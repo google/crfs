@@ -171,6 +171,10 @@ type TOCEntry struct {
 	// Xattrs are the extended attribute for the entry.
 	Xattrs map[string][]byte `json:"xattrs,omitempty"`
 
+	// Digest stores the OCI checksum for regular files payload.
+	// It has the form "sha256:abcdef01234....".
+	Digest string `json:"digest,omitempty"`
+
 	// ChunkOffset is non-zero if this is a chunk of a large,
 	// regular file. If so, the Offset is where the gzip header of
 	// ChunkSize bytes at ChunkOffset in Name begin.
@@ -738,9 +742,19 @@ func (w *Writer) AppendTar(r io.Reader) error {
 			return fmt.Errorf("unsupported input tar entry %q", h.Typeflag)
 		}
 
+		// We need to keep a reference to the TOC entry for regular files, so that we
+		// can fill the digest later.
+		var regFileEntry *TOCEntry
+		var payloadDigest hash.Hash
+		if h.Typeflag == tar.TypeReg {
+			regFileEntry = ent
+			payloadDigest = sha256.New()
+		}
+
 		if h.Typeflag == tar.TypeReg && ent.Size > 0 {
 			var written int64
 			totalSize := ent.Size // save it before we destroy ent
+			tee := io.TeeReader(tr, payloadDigest)
 			for written < totalSize {
 				if err := w.closeGz(); err != nil {
 					return err
@@ -758,7 +772,7 @@ func (w *Writer) AppendTar(r io.Reader) error {
 
 				w.condOpenGz()
 
-				if _, err := io.CopyN(tw, tr, chunkSize); err != nil {
+				if _, err := io.CopyN(tw, tee, chunkSize); err != nil {
 					return fmt.Errorf("error copying %q: %v", h.Name, err)
 				}
 				w.toc.Entries = append(w.toc.Entries, ent)
@@ -770,6 +784,9 @@ func (w *Writer) AppendTar(r io.Reader) error {
 			}
 		} else {
 			w.toc.Entries = append(w.toc.Entries, ent)
+		}
+		if payloadDigest != nil {
+			regFileEntry.Digest = fmt.Sprintf("sha256:%x", payloadDigest.Sum(nil))
 		}
 		if err := tw.Flush(); err != nil {
 			return err
