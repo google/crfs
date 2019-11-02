@@ -48,25 +48,30 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const debug = false
+const (
+	debug = false
 
-var (
-	fuseDebug = flag.Bool("fuse_debug", false, "enable verbose FUSE debugging")
-
-	// A "whiteout" file is an empty file with a special filename that signifies a
-	// path should be deleted. Whiteouts have special prefix ".wh.".
+	// whiteoutPrefix is a filename prefix for a "whiteout" file which is an empty
+	// file that signifies a path should be deleted.
 	// See https://github.com/opencontainers/image-spec/blob/775207bd45b6cb8153ce218cc59351799217451f/layer.md#whiteouts
 	whiteoutPrefix = ".wh."
 
-	// "Opaque whiteout" indicates that all siblings are hidden in the lower layer.
+	// whiteoutOpaqueDir is a filename of "opaque whiteout" which indicates that
+	// all siblings are hidden in the lower layer.
 	// See https://github.com/opencontainers/image-spec/blob/775207bd45b6cb8153ce218cc59351799217451f/layer.md#opaque-whiteout
 	whiteoutOpaqueDir = whiteoutPrefix + whiteoutPrefix + ".opq"
 
-	// In the overlayfs, a directory is made opaque by setting the xattr
-	// "trusted.overlay.opaque" to "y".
+	// opaqueXattr is a key of an xattr for an overalyfs opaque directory.
 	// See https://www.kernel.org/doc/Documentation/filesystems/overlayfs.txt
-	opaqueXattr      = "trusted.overlay.opaque"
+	opaqueXattr = "trusted.overlay.opaque"
+
+	// opaqueXattrValue is value of an xattr for an overalyfs opaque directory.
+	// See https://www.kernel.org/doc/Documentation/filesystems/overlayfs.txt
 	opaqueXattrValue = "y"
+)
+
+var (
+	fuseDebug = flag.Bool("fuse_debug", false, "enable verbose FUSE debugging")
 )
 
 func usage() {
@@ -978,7 +983,7 @@ func (n *node) Attr(ctx context.Context, a *fuse.Attr) error {
 func (h *nodeHandle) ReadDirAll(ctx context.Context) (ents []fuse.Dirent, err error) {
 	n := h.n
 	whiteouts := map[string]*stargz.TOCEntry{}
-	normalents := map[string]struct{}{}
+	normalEnts := map[string]bool{}
 	n.te.ForeachChild(func(baseName string, ent *stargz.TOCEntry) bool {
 		// We don't want to show ".wh."-prefixed whiteout files.
 		if strings.HasPrefix(baseName, whiteoutPrefix) {
@@ -990,7 +995,7 @@ func (h *nodeHandle) ReadDirAll(ctx context.Context) (ents []fuse.Dirent, err er
 			return true
 		}
 
-		normalents[baseName] = struct{}{}
+		normalEnts[baseName] = true
 		ents = append(ents, fuse.Dirent{
 			Inode: inodeOfEnt(ent),
 			Type:  direntType(ent),
@@ -1001,7 +1006,7 @@ func (h *nodeHandle) ReadDirAll(ctx context.Context) (ents []fuse.Dirent, err er
 
 	// Append whiteouts if no entry replaces the target entry in the lower layer.
 	for w, ent := range whiteouts {
-		if _, ok := normalents[w[len(whiteoutPrefix):]]; !ok {
+		if ok := normalEnts[w[len(whiteoutPrefix):]]; !ok {
 			ents = append(ents, fuse.Dirent{
 				Inode: inodeOfEnt(ent),
 				Type:  fuse.DT_Char,
