@@ -443,18 +443,17 @@ func hasNodeXattrs(entry, name, value string) crfsCheck {
 			}
 		}
 		if !found {
-			t.Errorf("node %q doesn't have an opaque xattr %q", entry, opaqueXattr)
+			t.Errorf("node %q doesn't have an xattr %q", entry, name)
 			return
 		}
 
 		// check the xattr has valid value.
 		getres := fuse.GetxattrResponse{}
 		if err := n.Getxattr(context.Background(), &fuse.GetxattrRequest{Name: name}, &getres); err != nil {
-			t.Fatalf("failed to get xattr %q of node %q: %v", opaqueXattr, entry, err)
+			t.Fatalf("failed to get xattr %q of node %q: %v", name, entry, err)
 		}
 		if string(getres.Xattr) != value {
-			t.Errorf("node %q has an invalid opaque directory xattr %q; want %q",
-				entry, getres.Xattr, opaqueXattrValue)
+			t.Errorf("node %q has an invalid xattr %q; want %q", entry, getres.Xattr, value)
 			return
 		}
 	})
