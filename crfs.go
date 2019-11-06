@@ -926,9 +926,9 @@ type node struct {
 	opaque bool     // true if this node is an overlayfs opaque directory
 
 	mu sync.Mutex // guards child, below
-	// child maps from previously-looked up base names (like "foo.txt") to the *node
-	// that was previously returned. This prevents FUSE inode numbers from getting
-	// out of sync
+	// child maps from previously-looked up base names (like "foo.txt") to the
+	// fspkg.Node that was previously returned. This prevents FUSE inode numbers
+	// from getting out of sync
 	child map[string]fspkg.Node
 }
 
