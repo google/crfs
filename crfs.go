@@ -48,7 +48,27 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const debug = false
+const (
+	debug = false
+
+	// whiteoutPrefix is a filename prefix for a "whiteout" file which is an empty
+	// file that signifies a path should be deleted.
+	// See https://github.com/opencontainers/image-spec/blob/775207bd45b6cb8153ce218cc59351799217451f/layer.md#whiteouts
+	whiteoutPrefix = ".wh."
+
+	// whiteoutOpaqueDir is a filename of "opaque whiteout" which indicates that
+	// all siblings are hidden in the lower layer.
+	// See https://github.com/opencontainers/image-spec/blob/775207bd45b6cb8153ce218cc59351799217451f/layer.md#opaque-whiteout
+	whiteoutOpaqueDir = whiteoutPrefix + whiteoutPrefix + ".opq"
+
+	// opaqueXattr is a key of an xattr for an overalyfs opaque directory.
+	// See https://www.kernel.org/doc/Documentation/filesystems/overlayfs.txt
+	opaqueXattr = "trusted.overlay.opaque"
+
+	// opaqueXattrValue is value of an xattr for an overalyfs opaque directory.
+	// See https://www.kernel.org/doc/Documentation/filesystems/overlayfs.txt
+	opaqueXattrValue = "y"
+)
 
 var (
 	fuseDebug = flag.Bool("fuse_debug", false, "enable verbose FUSE debugging")
@@ -474,7 +494,7 @@ func (n *layerDebugRoot) Lookup(ctx context.Context, name string) (fspkg.Node, e
 		te:    root,
 		sr:    r,
 		f:     f,
-		child: make(map[string]*node),
+		child: make(map[string]fspkg.Node),
 	}, nil
 }
 
@@ -776,7 +796,7 @@ func (n *layerHostOwnerImageReference) Lookup(ctx context.Context, name string) 
 		fs:    n.fs,
 		te:    root,
 		sr:    r,
-		child: make(map[string]*node),
+		child: make(map[string]fspkg.Node),
 	}, nil
 }
 
@@ -899,16 +919,17 @@ func direntType(ent *stargz.TOCEntry) fuse.DirentType {
 // node is a CRFS node in the FUSE filesystem.
 // See https://godoc.org/bazil.org/fuse/fs#Node
 type node struct {
-	fs *FS
-	te *stargz.TOCEntry
-	sr *stargz.Reader
-	f  *os.File // non-nil if root & in debug mode
+	fs     *FS
+	te     *stargz.TOCEntry
+	sr     *stargz.Reader
+	f      *os.File // non-nil if root & in debug mode
+	opaque bool     // true if this node is an overlayfs opaque directory
 
 	mu sync.Mutex // guards child, below
-	// child maps from previously-looked up base names (like "foo.txt") to the *node
-	// that was previously returned. This prevents FUSE inode numbers from getting
-	// out of sync
-	child map[string]*node
+	// child maps from previously-looked up base names (like "foo.txt") to the
+	// fspkg.Node that was previously returned. This prevents FUSE inode numbers
+	// from getting out of sync
+	child map[string]fspkg.Node
 }
 
 var (
@@ -961,7 +982,20 @@ func (n *node) Attr(ctx context.Context, a *fuse.Attr) error {
 // https://godoc.org/bazil.org/fuse/fs#HandleReadDirAller
 func (h *nodeHandle) ReadDirAll(ctx context.Context) (ents []fuse.Dirent, err error) {
 	n := h.n
+	whiteouts := map[string]*stargz.TOCEntry{}
+	normalEnts := map[string]bool{}
 	n.te.ForeachChild(func(baseName string, ent *stargz.TOCEntry) bool {
+		// We don't want to show ".wh."-prefixed whiteout files.
+		if strings.HasPrefix(baseName, whiteoutPrefix) {
+			if baseName == whiteoutOpaqueDir {
+				return true
+			}
+			// Add an overlayfs-styled whiteout direntry later.
+			whiteouts[baseName] = ent
+			return true
+		}
+
+		normalEnts[baseName] = true
 		ents = append(ents, fuse.Dirent{
 			Inode: inodeOfEnt(ent),
 			Type:  direntType(ent),
@@ -969,6 +1003,18 @@ func (h *nodeHandle) ReadDirAll(ctx context.Context) (ents []fuse.Dirent, err er
 		})
 		return true
 	})
+
+	// Append whiteouts if no entry replaces the target entry in the lower layer.
+	for w, ent := range whiteouts {
+		if ok := normalEnts[w[len(whiteoutPrefix):]]; !ok {
+			ents = append(ents, fuse.Dirent{
+				Inode: inodeOfEnt(ent),
+				Type:  fuse.DT_Char,
+				Name:  w[len(whiteoutPrefix):],
+			})
+
+		}
+	}
 	sort.Slice(ents, func(i, j int) bool { return ents[i].Name < ents[j].Name })
 	return ents, nil
 }
@@ -983,16 +1029,34 @@ func (n *node) Lookup(ctx context.Context, name string) (fspkg.Node, error) {
 		return c, nil
 	}
 
-	e, ok := n.te.LookupChild(name)
-	if !ok {
+	// We don't want to show ".wh."-prefixed whiteout files.
+	if strings.HasPrefix(name, whiteoutPrefix) {
 		return nil, fuse.ENOENT
 	}
 
+	e, ok := n.te.LookupChild(name)
+	if !ok {
+		// If the entry exists as a whiteout, show an overlayfs-styled whiteout node.
+		if e, ok := n.te.LookupChild(fmt.Sprintf("%s%s", whiteoutPrefix, name)); ok {
+			c := &whiteout{e}
+			n.child[name] = c
+			return c, nil
+		}
+		return nil, fuse.ENOENT
+	}
+
+	var opaque bool
+	if _, ok := e.LookupChild(whiteoutOpaqueDir); ok {
+		// This entry is an opaque directory.
+		opaque = true
+	}
+
 	c := &node{
-		fs:    n.fs,
-		te:    e,
-		sr:    n.sr,
-		child: make(map[string]*node),
+		fs:     n.fs,
+		te:     e,
+		sr:     n.sr,
+		child:  make(map[string]fspkg.Node),
+		opaque: opaque,
 	}
 	n.child[name] = c
 
@@ -1014,6 +1078,10 @@ func (n *node) Readlink(ctx context.Context, req *fuse.ReadlinkRequest) (string,
 // See https://godoc.org/bazil.org/fuse/fs#NodeListxattrer
 func (n *node) Listxattr(ctx context.Context, req *fuse.ListxattrRequest, resp *fuse.ListxattrResponse) error {
 	var allXattrs []byte
+	if n.opaque {
+		// This node is an opaque directory so add overlayfs-compliant indicator.
+		allXattrs = append(append(allXattrs, []byte(opaqueXattr)...), 0)
+	}
 	for k, _ := range n.te.Xattrs {
 		allXattrs = append(append(allXattrs, []byte(k)...), 0)
 	}
@@ -1030,8 +1098,15 @@ func (n *node) Listxattr(ctx context.Context, req *fuse.ListxattrRequest, resp *
 //
 // See https://godoc.org/bazil.org/fuse/fs#NodeGetxattrer
 func (n *node) Getxattr(ctx context.Context, req *fuse.GetxattrRequest, resp *fuse.GetxattrResponse) error {
-
-	xattr := n.te.Xattrs[req.Name]
+	var xattr []byte
+	if req.Name == opaqueXattr {
+		if n.opaque {
+			// This node is an opaque directory so give overlayfs-compliant indicator.
+			xattr = []byte(opaqueXattrValue)
+		}
+	} else {
+		xattr = n.te.Xattrs[req.Name]
+	}
 	if req.Position >= uint32(len(xattr)) {
 		resp.Xattr = []byte{}
 		return nil
@@ -1054,6 +1129,22 @@ func (n *node) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 		}
 	}
 	return h, nil
+}
+
+// whiteout is an overlayfs whiteout file which is a character device with 0/0
+// device number.
+// See https://www.kernel.org/doc/Documentation/filesystems/overlayfs.txt
+type whiteout struct {
+	te *stargz.TOCEntry
+}
+
+func (w *whiteout) Attr(ctx context.Context, a *fuse.Attr) error {
+	a.Valid = 30 * 24 * time.Hour
+	a.Inode = inodeOfEnt(w.te)
+	a.Mode = os.ModeDevice | os.ModeCharDevice
+	a.Rdev = uint32(unix.Mkdev(0, 0))
+	a.Nlink = 1
+	return nil
 }
 
 // nodeHandle is a node that's been opened (opendir or for read).
