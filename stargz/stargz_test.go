@@ -235,16 +235,48 @@ func TestWriteAndOpen(t *testing.T) {
 				t.Errorf("number of gzip streams = %d; want %d", got, tt.wantNumGz)
 			}
 
-			r, err := Open(io.NewSectionReader(bytes.NewReader(b), 0, int64(len(b))))
-			if err != nil {
-				t.Fatalf("stargz.Open: %v", err)
+			sr := io.NewSectionReader(bytes.NewReader(b), 0, int64(len(b)))
+			tocSize := sr.Size() - getTocOff(t, sr)
+			for _, o := range []Option{
+				nil,
+				WithFooterChunkSize(-1),
+				WithFooterChunkSize(0),
+				WithFooterChunkSize(FooterSize),
+				WithFooterChunkSize(tocSize),
+				WithFooterChunkSize(tocSize * 2),
+			} {
+				var r *Reader
+				var err error
+				if o != nil {
+					r, err = Open(sr, o)
+				} else {
+					r, err = Open(sr)
+				}
+				if err != nil {
+					t.Fatalf("stargz.Open: %v", err)
+				}
+				for _, want := range tt.want {
+					want.check(t, r)
+				}
 			}
-			for _, want := range tt.want {
-				want.check(t, r)
-			}
-
 		})
 	}
+}
+
+func getTocOff(t *testing.T, sr *io.SectionReader) int64 {
+	if sr.Size() < FooterSize {
+		t.Fatalf("stargz size %d is smaller than the stargz footer size", sr.Size())
+	}
+	var footer [FooterSize]byte
+	if _, err := sr.ReadAt(footer[:], sr.Size()-FooterSize); err != nil {
+		t.Fatalf("error reading footer: %v", err)
+	}
+	tocOff, ok := parseFooter(footer[:])
+	if !ok {
+		t.Fatalf("error parsing footer")
+	}
+
+	return tocOff
 }
 
 func diffIDOfGz(t *testing.T, b []byte) string {

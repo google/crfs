@@ -62,25 +62,61 @@ type Reader struct {
 	chunks map[string][]*TOCEntry
 }
 
+// Option is a functional option for stargz file operations.
+type Option func(*options) error
+
+type options struct {
+	footerChunkSize int64
+}
+
+// WithFooterChunkSize is a functional option for overriding the default chunk
+// size to fetch to get the footer. By specifying bigger size than the footer,
+// we are hopefully able to get the TOC JSON file + footer in one go. The
+// specified size is must be bigger than FooterSize. If not, we use FooterSize
+// instead.
+func WithFooterChunkSize(size int64) Option {
+	return func(opts *options) error {
+		opts.footerChunkSize = size
+		return nil
+	}
+}
+
 // Open opens a stargz file for reading.
-func Open(sr *io.SectionReader) (*Reader, error) {
+func Open(sr *io.SectionReader, opts ...Option) (*Reader, error) {
 	if sr.Size() < FooterSize {
 		return nil, fmt.Errorf("stargz size %d is smaller than the stargz footer size", sr.Size())
 	}
-	// TODO: read a bigger chunk (1MB?) at once here to hopefully
-	// get the TOC + footer in one go.
-	var footer [FooterSize]byte
-	if _, err := sr.ReadAt(footer[:], sr.Size()-FooterSize); err != nil {
+	o := &options{
+		footerChunkSize: FooterSize,
+	}
+	for _, opt := range opts {
+		if err := opt(o); err != nil {
+			return nil, err
+		}
+	}
+	if o.footerChunkSize > sr.Size() {
+		o.footerChunkSize = sr.Size()
+	}
+	if o.footerChunkSize < FooterSize {
+		o.footerChunkSize = FooterSize
+	}
+
+	footerChunk := make([]byte, o.footerChunkSize)
+	if _, err := sr.ReadAt(footerChunk, sr.Size()-int64(len(footerChunk))); err != nil {
 		return nil, fmt.Errorf("error reading footer: %v", err)
 	}
-	tocOff, ok := parseFooter(footer[:])
+	tocOff, ok := parseFooter(footerChunk[len(footerChunk)-FooterSize:])
 	if !ok {
 		return nil, fmt.Errorf("error parsing footer")
 	}
-	tocTargz := make([]byte, sr.Size()-tocOff-FooterSize)
-	if _, err := sr.ReadAt(tocTargz, tocOff); err != nil {
-		return nil, fmt.Errorf("error reading %d byte TOC targz: %v", len(tocTargz), err)
+	if remain := sr.Size() - int64(len(footerChunk)) - tocOff; remain > 0 {
+		footerChunk = append(make([]byte, remain), footerChunk...)
+		if _, err := sr.ReadAt(footerChunk[:remain], tocOff); err != nil {
+			return nil, fmt.Errorf("error reading %d byte TOC targz: %v", remain, err)
+		}
 	}
+
+	tocTargz := footerChunk[tocOff-(sr.Size()-int64(len(footerChunk))) : len(footerChunk)-FooterSize]
 	zr, err := gzip.NewReader(bytes.NewReader(tocTargz))
 	if err != nil {
 		return nil, fmt.Errorf("malformed TOC gzip header: %v", err)
