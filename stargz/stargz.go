@@ -785,7 +785,7 @@ func (w *Writer) AppendTar(r io.Reader) error {
 		} else {
 			w.toc.Entries = append(w.toc.Entries, ent)
 		}
-		if payloadDigest != nil {
+		if regFileEntry != nil && payloadDigest != nil {
 			regFileEntry.Digest = fmt.Sprintf("sha256:%x", payloadDigest.Sum(nil))
 		}
 		if err := tw.Flush(); err != nil {
