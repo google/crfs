@@ -8,6 +8,15 @@ Discussion: https://github.com/golang/go/issues/30829
 container image, served directly from a container registry (such as
 [gcr.io](https://gcr.io/)), without pulling it all locally first.
 
+
+## Update
+
+This version of `stargz` is slightly different from Google's `stargz`.
+The origin format may case `Gzip(TarF(file1) + TarHeader(file2)) + GZip(TarF(file2) + TarFooter)`.
+This schema changes it to `Gzip(Tar(file1)) + Gzip(TarHeader(file2)) + GZip(TarF(file2)) + GZip(TarFooter)`.
+
+
+
 ## Background
 
 Starting a container should be fast. Currently, however, starting a
