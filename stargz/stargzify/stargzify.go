@@ -21,7 +21,6 @@ import (
 	"os"
 	"strings"
 
-	"github.com/google/crfs/stargz"
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/logs"
 	"github.com/google/go-containerregistry/pkg/name"
@@ -31,6 +30,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/stream"
 	"github.com/google/go-containerregistry/pkg/v1/types"
+	"github.com/mc256/crfs/stargz"
 )
 
 var (

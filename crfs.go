@@ -42,9 +42,9 @@ import (
 	"bazil.org/fuse"
 	fspkg "bazil.org/fuse/fs"
 	"cloud.google.com/go/compute/metadata"
-	"github.com/google/crfs/stargz"
 	namepkg "github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/google"
+	"github.com/mc256/crfs/stargz"
 	"golang.org/x/sys/unix"
 )
 
