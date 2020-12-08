@@ -19,7 +19,7 @@ import (
 
 	"bazil.org/fuse"
 	fspkg "bazil.org/fuse/fs"
-	"github.com/google/crfs/stargz"
+	"github.com/mc256/crfs/stargz"
 	"golang.org/x/sys/unix"
 )
 
