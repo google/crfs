@@ -187,6 +187,8 @@ type TOCEntry struct {
 	ChunkOffset int64 `json:"chunkOffset,omitempty"`
 	ChunkSize   int64 `json:"chunkSize,omitempty"`
 
+	CompressedSize int64 `json:"compressedSize,omitempty"`
+
 	children map[string]*TOCEntry
 }
 
@@ -573,7 +575,7 @@ func NewWriter(w io.Writer) *Writer {
 	return &Writer{
 		bw:       bw,
 		cw:       cw,
-		toc:      &jtoc{Version: 1},
+		toc:      &jtoc{Version: 2},
 		diffHash: sha256.New(),
 	}
 }
@@ -755,11 +757,16 @@ func (w *Writer) AppendTar(r io.Reader) error {
 			var written int64
 			totalSize := ent.Size // save it before we destroy ent
 			tee := io.TeeReader(tr, payloadDigest)
+			didWrite := false
+			var prevEnt *TOCEntry
+			prevEnt = nil
 			for written < totalSize {
 				if err := w.closeGz(); err != nil {
 					return err
 				}
-
+				if prevEnt != nil {
+					prevEnt.CompressedSize = w.cw.n - prevEnt.Offset
+				}
 				chunkSize := int64(w.chunkSize())
 				remain := totalSize - written
 				if remain < chunkSize {
@@ -771,26 +778,38 @@ func (w *Writer) AppendTar(r io.Reader) error {
 				ent.ChunkOffset = written
 
 				w.condOpenGz()
-
+				didWrite = true
 				if _, err := io.CopyN(tw, tee, chunkSize); err != nil {
 					return fmt.Errorf("error copying %q: %v", h.Name, err)
 				}
+				prevEnt = ent
 				w.toc.Entries = append(w.toc.Entries, ent)
 				written += chunkSize
+
 				ent = &TOCEntry{
 					Name: h.Name,
 					Type: "chunk",
 				}
 			}
+			if didWrite {
+				if err := w.closeGz(); err != nil {
+					return err
+				}
+				if prevEnt != nil {
+					prevEnt.CompressedSize = w.cw.n - prevEnt.Offset
+				}
+				w.condOpenGz()
+			}
 		} else {
 			w.toc.Entries = append(w.toc.Entries, ent)
 		}
-		if payloadDigest != nil {
+		if regFileEntry != nil && payloadDigest != nil {
 			regFileEntry.Digest = fmt.Sprintf("sha256:%x", payloadDigest.Sum(nil))
 		}
 		if err := tw.Flush(); err != nil {
 			return err
 		}
+
 	}
 	return nil
 }

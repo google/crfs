@@ -1,4 +1,4 @@
-module github.com/google/crfs
+module github.com/mc256/crfs
 
 go 1.12
 
